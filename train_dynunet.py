@@ -21,8 +21,10 @@ import math
 import random
 import time
 import argparse
+import re
+import csv
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 
 import numpy as np
@@ -53,6 +55,8 @@ except Exception as e:
 # ----------------------------- Config ---------------------------------
 
 DATA_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects"
+NPY_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects_npy"
+META_CSV = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects/metadata.csv"
 OUTPUT_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output"
 
 # Local artifact directories
@@ -66,12 +70,12 @@ PATCH_SIZE = (96, 96, 96)  ###(80, 80, 80)
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
 PATCH_STRIDE = (80, 80, 80)  ###(64, 64, 64)
 
-MAX_PATIENTS = 3  ###None  # set to an int to limit for quick tests
-VAL_FRACTION = 0.2
+MAX_PATIENTS = None  # set to an int to limit for quick tests
+VAL_FRACTION = 0.05  
 RANDOM_SEED = 42
 
-BATCH_SIZE = 8
-EPOCHS = 2  ###10
+BATCH_SIZE = 16
+EPOCHS = 20
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -131,6 +135,192 @@ def write_nifti(volume: np.ndarray, meta: Dict, out_path: str):
     sitk.WriteImage(img, out_path)
 
 
+# -------------------- DICOM -> NPY caching utils -----------------------
+
+def _serialize_vec(vec) -> str:
+    try:
+        return "|".join([f"{float(v):.8g}" for v in list(vec)])
+    except Exception:
+        return ""
+
+
+def _parse_vec(s: str) -> Optional[Tuple[float, ...]]:
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split("|") if p.strip() != ""]
+    try:
+        return tuple(float(p) for p in parts)
+    except Exception:
+        return None
+
+
+def _parse_shape(s: str) -> Optional[Tuple[int, int, int]]:
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split("|") if p.strip() != ""]
+    if len(parts) != 3:
+        return None
+    try:
+        d, h, w = (int(float(p)) for p in parts)
+        return (d, h, w)
+    except Exception:
+        return None
+
+
+def _series_match_drf(name: str) -> Optional[int]:
+    """Return DRF int if folder looks like '1-10 dose', else None."""
+    m = re.match(r"^1-(\d+)\s*dose$", name.strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _parse_float(s: str) -> Optional[float]:
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _ensure_stats_in_metadata(meta_csv_path: str, npy_root: str):
+    """If metadata.csv exists but lacks mean/std per row, compute from NPY files and rewrite.
+
+    Minimal implementation: reads entire CSV into memory, computes missing stats, and writes back
+    with added columns 'mean' and 'std'.
+    """
+    if not os.path.isfile(meta_csv_path):
+        return
+    try:
+        rows = []
+        with open(meta_csv_path, "r", newline="") as f:
+            r = csv.DictReader(f)
+            # normalize fieldnames and detect if stats present
+            have_mean = "mean" in (r.fieldnames or [])
+            have_std = "std" in (r.fieldnames or [])
+            for row in tqdm(r, desc="Ensuring stats in metadata", unit="file"):
+                # compute if missing or empty
+                need = (not have_mean) or (not have_std) or (row.get("mean", "") == "") or (row.get("std", "") == "")
+                if need:
+                    fpath = os.path.join(npy_root, row.get("file", ""))
+                    try:
+                        arr = np.load(fpath, mmap_mode="r")
+                        m = float(np.mean(arr))
+                        s = float(np.std(arr))
+                    except Exception:
+                        m, s = 0.0, 1.0
+                    row["mean"] = f"{m:.8g}"
+                    row["std"] = f"{s:.8g}"
+                rows.append(row)
+        # write back with ensured columns
+        fieldnames = [
+            "pid", "series", "drf", "file", "shape", "spacing", "origin", "direction", "mean", "std"
+        ]
+        with open(meta_csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in fieldnames})
+    except Exception:
+        # keep minimal error handling per request
+        pass
+
+
+def convert_all_to_npy_if_needed(data_root: str = DATA_ROOT, npy_root: str = NPY_ROOT, meta_csv_path: str = META_CSV):
+    """If the NPY cache folder does not exist, build it by converting all .IMA.
+
+    Writes per-series .npy files to `npy_root` and metadata.csv to the `all_subjects` folder.
+    """
+    if os.path.isdir(npy_root) and os.path.isfile(meta_csv_path):
+        # If metadata exists, ensure it contains per-file stats, then return.
+        _ensure_stats_in_metadata(meta_csv_path, npy_root)
+        return
+
+    os.makedirs(npy_root, exist_ok=True)
+
+    rows = []
+    pids = [d for d in sorted(os.listdir(data_root)) if os.path.isdir(os.path.join(data_root, d))]
+    print(f"Converting DICOM -> NPY for {len(pids)} patients ...")
+    for pid in tqdm(pids, desc="Convert", unit="pid"):
+        pdir = os.path.join(data_root, pid)
+        if not os.path.isdir(pdir):
+            continue
+
+        # 1) Target series (Full_dose)
+        tgt_dir = os.path.join(pdir, "Full_dose")
+        tgt_file = None
+        tgt_meta = None
+        try:
+            if os.path.isdir(tgt_dir):
+                vol, meta = read_dicom_series(tgt_dir)
+                tgt_file = f"{pid}__full.npy"
+                np.save(os.path.join(npy_root, tgt_file), vol)
+                # simple stats
+                t_m = float(np.mean(vol))
+                t_s = float(np.std(vol))
+                tgt_meta = meta
+                rows.append({
+                    "pid": pid,
+                    "series": "target",
+                    "drf": "full",
+                    "file": tgt_file,
+                    "shape": f"{vol.shape[0]}|{vol.shape[1]}|{vol.shape[2]}",
+                    "spacing": _serialize_vec(meta.get("spacing", [])),
+                    "origin": _serialize_vec(meta.get("origin", [])),
+                    "direction": _serialize_vec(meta.get("direction", [])),
+                    "mean": f"{t_m:.8g}",
+                    "std": f"{t_s:.8g}",
+                })
+        except Exception as e:
+            print(f"Warning: failed to convert target for {pid}: {e}")
+
+        # 2) Input series (any folder matching '1-<drf> dose')
+        try:
+            for sub in sorted(os.listdir(pdir)):
+                drf = _series_match_drf(sub)
+                if drf is None:
+                    continue
+                sdir = os.path.join(pdir, sub)
+                try:
+                    vol, meta = read_dicom_series(sdir)
+                    in_file = f"{pid}__drf{drf}.npy"
+                    np.save(os.path.join(npy_root, in_file), vol)
+                    i_m = float(np.mean(vol))
+                    i_s = float(np.std(vol))
+                    rows.append({
+                        "pid": pid,
+                        "series": "input",
+                        "drf": str(drf),
+                        "file": in_file,
+                        "shape": f"{vol.shape[0]}|{vol.shape[1]}|{vol.shape[2]}",
+                        "spacing": _serialize_vec(meta.get("spacing", [])),
+                        "origin": _serialize_vec(meta.get("origin", [])),
+                        "direction": _serialize_vec(meta.get("direction", [])),
+                        "mean": f"{i_m:.8g}",
+                        "std": f"{i_s:.8g}",
+                    })
+                except Exception as e:
+                    print(f"Warning: failed to convert input {pid} {sub}: {e}")
+        except Exception:
+            pass
+
+    # Write metadata CSV
+    try:
+        os.makedirs(os.path.dirname(meta_csv_path), exist_ok=True)
+        with open(meta_csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "pid", "series", "drf", "file", "shape", "spacing", "origin", "direction", "mean", "std"
+            ])
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        print(f"Wrote metadata: {meta_csv_path}")
+    except Exception as e:
+        print(f"Failed to write metadata CSV: {e}")
+
+
 # --------------------------- Data Handling -----------------------------
 
 @dataclass
@@ -140,6 +330,17 @@ class PatientItem:
     target_arr: np.ndarray  # [D,H,W]
     input_meta: Dict
     target_meta: Dict
+
+
+@dataclass
+class NpyEntry:
+    """Lightweight descriptor for a patient pair stored as NPY files."""
+    pid: str
+    in_path: str
+    tg_path: str
+    pair_shape: Tuple[int, int, int]  # min dims (D,H,W) across input/target
+    in_meta: Dict
+    tg_meta: Dict
 
 
 def zscore(x: np.ndarray) -> np.ndarray:
@@ -159,13 +360,91 @@ def find_patients(data_root: str) -> List[str]:
     return pids
 
 
-def load_patient(data_root: str, pid: str, drf: int) -> PatientItem:
-    in_dir = os.path.join(data_root, pid, f"1-{drf} dose")
-    tgt_dir = os.path.join(data_root, pid, "Full_dose")
-    in_vol, in_meta = read_dicom_series(in_dir)
-    tgt_vol, tgt_meta = read_dicom_series(tgt_dir)
+def load_metadata_index(meta_csv_path: str = META_CSV) -> Dict[Tuple[str, str, str], Dict]:
+    """Load metadata CSV into a dict keyed by (series,input/target) and (pid,drf).
 
-    # Simple size alignment if small mismatches; crop to min dims
+    Key format: (series, pid, drf_str) where drf_str is str(int) for inputs and 'full' for target.
+    Values contain keys: file, spacing, origin, direction, shape.
+    """
+    idx: Dict[Tuple[str, str, str], Dict] = {}
+    if not os.path.isfile(meta_csv_path):
+        return idx
+    try:
+        with open(meta_csv_path, "r", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                key = (row.get("series", ""), row.get("pid", ""), row.get("drf", ""))
+                if not key[0] or not key[1] or not key[2]:
+                    continue
+                idx[key] = {
+                    "file": row.get("file", ""),
+                    "shape": row.get("shape", ""),
+                    "spacing": _parse_vec(row.get("spacing", "")),
+                    "origin": _parse_vec(row.get("origin", "")),
+                    "direction": _parse_vec(row.get("direction", "")),
+                    "mean": _parse_float(row.get("mean", "")),
+                    "std": _parse_float(row.get("std", "")),
+                }
+    except Exception as e:
+        print(f"Warning: failed to read metadata.csv: {e}")
+    return idx
+
+
+def build_npy_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[str], drf: int, npy_root: str = NPY_ROOT) -> List[NpyEntry]:
+    entries: List[NpyEntry] = []
+    for pid in pids:
+        in_key = ("input", pid, str(drf))
+        tg_key = ("target", pid, "full")
+        if in_key not in meta_idx or tg_key not in meta_idx:
+            continue
+        in_rec = meta_idx[in_key]
+        tg_rec = meta_idx[tg_key]
+        in_shape = _parse_shape(in_rec.get("shape", ""))
+        tg_shape = _parse_shape(tg_rec.get("shape", ""))
+        if not in_shape or not tg_shape:
+            continue
+        pair_shape = (min(in_shape[0], tg_shape[0]), min(in_shape[1], tg_shape[1]), min(in_shape[2], tg_shape[2]))
+        entries.append(NpyEntry(
+            pid=pid,
+            in_path=os.path.join(npy_root, in_rec["file"]),
+            tg_path=os.path.join(npy_root, tg_rec["file"]),
+            pair_shape=pair_shape,
+            in_meta={
+                "spacing": in_rec.get("spacing"),
+                "origin": in_rec.get("origin"),
+                "direction": in_rec.get("direction"),
+                "mean": in_rec.get("mean"),
+                "std": in_rec.get("std"),
+            },
+            tg_meta={
+                "spacing": tg_rec.get("spacing"),
+                "origin": tg_rec.get("origin"),
+                "direction": tg_rec.get("direction"),
+                "mean": tg_rec.get("mean"),
+                "std": tg_rec.get("std"),
+            },
+        ))
+    return entries
+
+
+def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Dict], pid: str, drf: int) -> PatientItem:
+    """Load a patient input/target pair from NPY cache, crop-align, z-score."""
+    in_key = ("input", pid, str(drf))
+    tg_key = ("target", pid, "full")
+    if in_key not in meta_idx or tg_key not in meta_idx:
+        raise RuntimeError(f"Missing NPY/meta for pid={pid} drf={drf}")
+
+    in_rec = meta_idx[in_key]
+    tg_rec = meta_idx[tg_key]
+    in_path = os.path.join(npy_root, in_rec["file"])
+    tg_path = os.path.join(npy_root, tg_rec["file"])
+    if not os.path.isfile(in_path) or not os.path.isfile(tg_path):
+        raise RuntimeError(f"NPY files not found for pid={pid} drf={drf}")
+
+    in_vol = np.load(in_path)
+    tgt_vol = np.load(tg_path)
+
+    # Crop-align to min dims
     dz = min(in_vol.shape[0], tgt_vol.shape[0])
     dy = min(in_vol.shape[1], tgt_vol.shape[1])
     dx = min(in_vol.shape[2], tgt_vol.shape[2])
@@ -176,7 +455,23 @@ def load_patient(data_root: str, pid: str, drf: int) -> PatientItem:
     in_vol = zscore(in_vol).astype(np.float32, copy=False)
     tgt_vol = zscore(tgt_vol).astype(np.float32, copy=False)
 
-    return PatientItem(pid=pid, input_arr=in_vol, target_arr=tgt_vol, input_meta=in_meta, target_meta=tgt_meta)
+    in_meta = {
+        "spacing": in_rec.get("spacing"),
+        "origin": in_rec.get("origin"),
+        "direction": in_rec.get("direction"),
+    }
+    tg_meta = {
+        "spacing": tg_rec.get("spacing"),
+        "origin": tg_rec.get("origin"),
+        "direction": tg_rec.get("direction"),
+    }
+    return PatientItem(pid=pid, input_arr=in_vol, target_arr=tgt_vol, input_meta=in_meta, target_meta=tg_meta)
+
+
+def load_patient(data_root: str, pid: str, drf: int) -> PatientItem:
+    """Deprecated DICOM loader retained for reference; now loads from NPY cache."""
+    meta_idx = load_metadata_index(META_CSV)
+    return load_patient_from_npy(NPY_ROOT, meta_idx, pid, drf)
 
 
 def compute_grid(starts: int, size: int, step: int) -> List[int]:
@@ -257,6 +552,67 @@ class PatchDataset(Dataset):
         return xt, yt
 
 
+class LazyPatchDataset(Dataset):
+    """Patch dataset that loads from NPY at __getitem__ time.
+
+    Uses numpy memmap loading to slice patches without reading full volumes into RAM.
+    Normalizes using precomputed per-volume mean/std from metadata.
+    """
+
+    def __init__(self, entries: List[NpyEntry], patch_size: Tuple[int, int, int], stride: Tuple[int, int, int], augment: bool = True):
+        self.entries = entries
+        self.patch_size = patch_size
+        self.stride = stride
+        self.augment = augment
+
+        # Precompute patch coordinates for all entries using pair_shape
+        self.index: List[Tuple[int, Tuple[int, int, int]]] = []  # (entry_idx, (z,y,x))
+        for ei, e in enumerate(self.entries):
+            coords = enumerate_patches(e.pair_shape, patch_size, stride)
+            for c in coords:
+                self.index.append((ei, c))
+
+        # No unbounded caches; open mmaps on demand in __getitem__ and let them go
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    # No helper memoization needed for minimal prototype
+
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        ei, (z, y, x) = self.index[i]
+        e = self.entries[ei]
+        pd, ph, pw = self.patch_size
+
+        # Open memmaps on demand; do not cache
+        in_mm = np.load(e.in_path, mmap_mode='r')
+        tg_mm = np.load(e.tg_path, mmap_mode='r')
+
+        # Load only the needed patch window via mmap slicing
+        xin = np.asarray(in_mm[z:z+pd, y:y+ph, x:x+pw])
+        ygt = np.asarray(tg_mm[z:z+pd, y:y+ph, x:x+pw])
+
+        # Per-volume z-score using precomputed mean/std from metadata
+        in_m = float(e.in_meta.get("mean") or 0.0)
+        in_s = float(e.in_meta.get("std") or 1.0)
+        tg_m = float(e.tg_meta.get("mean") or 0.0)
+        tg_s = float(e.tg_meta.get("std") or 1.0)
+        if in_s <= 1e-6:
+            in_s = 1.0
+        if tg_s <= 1e-6:
+            tg_s = 1.0
+        xin = ((xin - in_m) / in_s).astype(np.float32, copy=False)
+        ygt = ((ygt - tg_m) / tg_s).astype(np.float32, copy=False)
+
+        xt = torch.from_numpy(xin).unsqueeze(0)
+        yt = torch.from_numpy(ygt).unsqueeze(0)
+
+        if self.augment:
+            xt, yt = random_augment(xt, yt)
+
+        return xt, yt
+
+
 # ----------------------------- Model -----------------------------------
 
 def make_model() -> nn.Module:
@@ -293,7 +649,7 @@ def plot_curves(train_hist: List[float], val_hist: List[float], out_png: str):
     plt.close()
 
 
-def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
+def train_and_validate(train_ds: PatchDataset, val_ds: PatchDataset):
     torch.manual_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -307,8 +663,13 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     # MONAI sliding window inferer for validation/inference
     inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.2, mode="gaussian")
 
-    loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=32, 
-                        pin_memory=(DEVICE.type == "cuda"), persistent_workers=True)
+    # loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=32, 
+    #                     pin_memory=(DEVICE.type == "cuda"), persistent_workers=True)
+    loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=8,
+                        pin_memory=False, persistent_workers=False)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=4,
+                            pin_memory=False, persistent_workers=False)
+    
 
     train_hist: List[float] = []
     val_hist: List[float] = []
@@ -351,26 +712,26 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 
             opt.zero_grad()
             pred = model(xb)
-            l = LOSS_MSE_W * mse(pred, yb) ###+ LOSS_SSIM_W * ssim(pred, yb)
+            l = LOSS_MSE_W * mse(pred, yb) + LOSS_SSIM_W * ssim(pred, yb)
             l.backward()
             opt.step()
             ep_loss += float(l.item())
             n_batches += 1
 
-            # Print GPU memory usage once (after first optimization step)
-            if (not printed_gpu_mem) and DEVICE.type == "cuda":
-                try:
-                    torch.cuda.synchronize()
-                    dev_idx = torch.cuda.current_device()
-                    props = torch.cuda.get_device_properties(dev_idx)
-                    alloc = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
-                    reserved = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
-                    max_alloc = torch.cuda.max_memory_allocated(dev_idx) / (1024 ** 3)
-                    total = getattr(props, 'total_memory', 0) / (1024 ** 3)
-                    print(f"GPU memory: alloc={alloc:.2f}GB reserved={reserved:.2f}GB peak={max_alloc:.2f}GB total={total:.2f}GB")
-                except Exception:
-                    pass
-                printed_gpu_mem = True
+        # Print GPU memory usage once (after first optimization step)
+        if (not printed_gpu_mem) and DEVICE.type == "cuda":
+            try:
+                torch.cuda.synchronize()
+                dev_idx = torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(dev_idx)
+                alloc = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
+                reserved = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
+                max_alloc = torch.cuda.max_memory_allocated(dev_idx) / (1024 ** 3)
+                total = getattr(props, 'total_memory', 0) / (1024 ** 3)
+                print(f"GPU memory: alloc={alloc:.2f}GB reserved={reserved:.2f}GB peak={max_alloc:.2f}GB total={total:.2f}GB")
+            except Exception:
+                pass
+            printed_gpu_mem = True
         train_loss = ep_loss / max(1, n_batches)
         train_hist.append(train_loss)
 
@@ -379,9 +740,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
         with torch.no_grad():
             vloss_acc = 0.0
             vcount = 0
-            for vp in val_patients:
-                xt = torch.from_numpy(vp.input_arr).float()[None, None]  # [1,1,D,H,W]
-                yt = torch.from_numpy(vp.target_arr).float()[None, None]
+            for xt, yt in tqdm(val_loader, desc="Validation", unit="case"):
                 xt = xt.to(DEVICE)
                 yt = yt.to(DEVICE)
                 pred_full = inferer(xt, model)
@@ -430,7 +789,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
 
             # Save NIfTI
             pred_np = pred[0, 0].cpu().numpy()
-            out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}.nii.gz")
+            out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}_{RUN_ID}.nii.gz")
             try:
                 write_nifti(pred_np, p.input_meta, out_path)
             except Exception:
@@ -571,6 +930,12 @@ def main():
     CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
+    # Ensure NPY cache exists; convert if first run
+    convert_all_to_npy_if_needed(DATA_ROOT, NPY_ROOT, META_CSV)
+
+    # Build metadata index
+    meta_idx = load_metadata_index(META_CSV)
+
     all_pids = find_patients(DATA_ROOT)
     if MAX_PATIENTS is not None:
         all_pids = all_pids[:MAX_PATIENTS]
@@ -589,30 +954,29 @@ def main():
 
     print(f"Patients: train={len(train_pids)} val={len(val_pids)} total={len(all_pids)}")
 
-    # Load volumes
-    train_patients: List[PatientItem] = []
-    val_patients: List[PatientItem] = []
-    for pid in train_pids:
-        try:
-            train_patients.append(load_patient(DATA_ROOT, pid, args.drf))
-        except Exception as e:
-            print(f"Skipping train {pid}: {e}")
-    for pid in val_pids:
-        try:
-            val_patients.append(load_patient(DATA_ROOT, pid, args.drf))
-        except Exception as e:
-            print(f"Skipping val {pid}: {e}")
-
-    if not train_patients:
-        print("No training patients loaded.")
+    # Build NPY entries and lazy patch dataset for training
+    train_entries = build_npy_entries(meta_idx, train_pids, args.drf, NPY_ROOT)
+    val_entries = build_npy_entries(meta_idx, val_pids, args.drf, NPY_ROOT)
+    if not train_entries:
+        print("No training patients available with required NPY pairs.")
         return
 
-    # Build patch dataset
-    train_ds = PatchDataset(train_patients, PATCH_SIZE, PATCH_STRIDE, augment=True)
-    print(f"Train patches: {len(train_ds)}")
+    train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True)
+    print(f"Train patches: {len(train_ds)} across {len(train_entries)} patients")
+
+    # Load full volumes for validation only (smaller set) just-in-time
+    val_ds = LazyPatchDataset(val_entries, PATCH_SIZE, PATCH_STRIDE, augment=False)
+    print(f"Val patches: {len(val_ds)} across {len(val_entries)} patients")
+    
+    val_patients: List[PatientItem] = []
+    for e in val_entries:
+        try:
+            val_patients.append(load_patient_from_npy(NPY_ROOT, meta_idx, e.pid, args.drf))
+        except Exception as ex:
+            print(f"Skipping val {e.pid}: {ex}")
 
     # Train
-    model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_patients)
+    model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_ds)
 
     # Save trained model with run id
     os.makedirs(MODEL_DIR, exist_ok=True)
