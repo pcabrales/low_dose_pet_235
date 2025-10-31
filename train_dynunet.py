@@ -66,6 +66,7 @@ MODEL_DIR = os.path.join(BASE_DIR, "trained-models")
 RUN_ID = time.strftime("%Y%m%d_%H%M")  # updated later to include DRF
 RUN_ID_BASE = RUN_ID
 
+MODEL_NAME = "DynUNet"  # or "nnFormer"
 PATCH_SIZE = (96, 96, 96)  ###(80, 80, 80)
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
 PATCH_STRIDE = (80, 80, 80)  ###(64, 64, 64)
@@ -206,7 +207,8 @@ def _ensure_stats_in_metadata(meta_csv_path: str, npy_root: str):
                 if need:
                     fpath = os.path.join(npy_root, row.get("file", ""))
                     try:
-                        arr = np.load(fpath, mmap_mode="r")
+                        x = np.load(fpath)
+                        arr = x["arr"] if isinstance(x, np.lib.npyio.NpzFile) else x
                         m = float(np.mean(arr))
                         s = float(np.std(arr))
                     except Exception:
@@ -229,9 +231,9 @@ def _ensure_stats_in_metadata(meta_csv_path: str, npy_root: str):
 
 
 def convert_all_to_npy_if_needed(data_root: str = DATA_ROOT, npy_root: str = NPY_ROOT, meta_csv_path: str = META_CSV):
-    """If the NPY cache folder does not exist, build it by converting all .IMA.
+    """If the cache folder does not exist, build it by converting all .IMA.
 
-    Writes per-series .npy files to `npy_root` and metadata.csv to the `all_subjects` folder.
+    Writes per-series compressed .npz files to `npy_root` and metadata.csv to the `all_subjects` folder.
     """
     if os.path.isdir(npy_root) and os.path.isfile(meta_csv_path):
         # If metadata exists, ensure it contains per-file stats, then return.
@@ -242,7 +244,7 @@ def convert_all_to_npy_if_needed(data_root: str = DATA_ROOT, npy_root: str = NPY
 
     rows = []
     pids = [d for d in sorted(os.listdir(data_root)) if os.path.isdir(os.path.join(data_root, d))]
-    print(f"Converting DICOM -> NPY for {len(pids)} patients ...")
+    print(f"Converting DICOM -> NPZ for {len(pids)} patients ...")
     for pid in tqdm(pids, desc="Convert", unit="pid"):
         pdir = os.path.join(data_root, pid)
         if not os.path.isdir(pdir):
@@ -255,8 +257,10 @@ def convert_all_to_npy_if_needed(data_root: str = DATA_ROOT, npy_root: str = NPY
         try:
             if os.path.isdir(tgt_dir):
                 vol, meta = read_dicom_series(tgt_dir)
-                tgt_file = f"{pid}__full.npy"
-                np.save(os.path.join(npy_root, tgt_file), vol)
+                if vol.dtype == np.float64:
+                    vol = vol.astype(np.float32, copy=False)
+                tgt_file = f"{pid}__full.npz"
+                np.savez_compressed(os.path.join(npy_root, tgt_file), arr=vol)
                 # simple stats
                 t_m = float(np.mean(vol))
                 t_s = float(np.std(vol))
@@ -285,8 +289,10 @@ def convert_all_to_npy_if_needed(data_root: str = DATA_ROOT, npy_root: str = NPY
                 sdir = os.path.join(pdir, sub)
                 try:
                     vol, meta = read_dicom_series(sdir)
-                    in_file = f"{pid}__drf{drf}.npy"
-                    np.save(os.path.join(npy_root, in_file), vol)
+                    if vol.dtype == np.float64:
+                        vol = vol.astype(np.float32, copy=False)
+                    in_file = f"{pid}__drf{drf}.npz"
+                    np.savez_compressed(os.path.join(npy_root, in_file), arr=vol)
                     i_m = float(np.mean(vol))
                     i_s = float(np.std(vol))
                     rows.append({
@@ -441,8 +447,10 @@ def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Di
     if not os.path.isfile(in_path) or not os.path.isfile(tg_path):
         raise RuntimeError(f"NPY files not found for pid={pid} drf={drf}")
 
-    in_vol = np.load(in_path)
-    tgt_vol = np.load(tg_path)
+    x = np.load(in_path)
+    in_vol = x["arr"] if isinstance(x, np.lib.npyio.NpzFile) else x
+    x = np.load(tg_path)
+    tgt_vol = x["arr"] if isinstance(x, np.lib.npyio.NpzFile) else x
 
     # Crop-align to min dims
     dz = min(in_vol.shape[0], tgt_vol.shape[0])
@@ -584,13 +592,17 @@ class LazyPatchDataset(Dataset):
         e = self.entries[ei]
         pd, ph, pw = self.patch_size
 
-        # Open memmaps on demand; do not cache
-        in_mm = np.load(e.in_path, mmap_mode='r')
-        tg_mm = np.load(e.tg_path, mmap_mode='r')
+        # Load arrays; for .npz use the 'arr' key
+        xi = np.load(e.in_path)
+        if isinstance(xi, np.lib.npyio.NpzFile):
+            xi = xi["arr"]
+        yi = np.load(e.tg_path)
+        if isinstance(yi, np.lib.npyio.NpzFile):
+            yi = yi["arr"]
 
-        # Load only the needed patch window via mmap slicing
-        xin = np.asarray(in_mm[z:z+pd, y:y+ph, x:x+pw])
-        ygt = np.asarray(tg_mm[z:z+pd, y:y+ph, x:x+pw])
+        # Slice needed patch window
+        xin = np.asarray(xi[z:z+pd, y:y+ph, x:x+pw])
+        ygt = np.asarray(yi[z:z+pd, y:y+ph, x:x+pw])
 
         # Per-volume z-score using precomputed mean/std from metadata
         in_m = float(e.in_meta.get("mean") or 0.0)
@@ -615,21 +627,33 @@ class LazyPatchDataset(Dataset):
 
 # ----------------------------- Model -----------------------------------
 
-def make_model() -> nn.Module:
-    kernel_size = [[3, 3, 3]] * 5
-    strides = [1, 2, 2, 2, 2]
-    up_kernels = [2, 2, 2, 2]
-    model = DynUNet(
-        spatial_dims=3,
-        in_channels=1,
-        out_channels=1,
-        kernel_size=kernel_size,
-        strides=strides,
-        upsample_kernel_size=up_kernels,
-        norm_name=("instance", {"affine": True}),
-        act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
-        deep_supervision=False,
-    )
+def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96, 96, 96)) -> nn.Module:
+    if model_name.lower() == "dynunet":
+        kernel_size = [[3, 3, 3]] * 5
+        strides = [1, 2, 2, 2, 2]
+        up_kernels = [2, 2, 2, 2]
+        # add to make the model larger: filters=[16, 32, 64, 128, 256, 512]
+        model = DynUNet(
+            spatial_dims=3,
+            in_channels=1,
+            out_channels=1,
+            kernel_size=kernel_size,
+            strides=strides,
+            upsample_kernel_size=up_kernels,
+            norm_name=("instance", {"affine": True}),
+            act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
+            deep_supervision=False,
+        )
+    elif model_name.lower() == "nnformer":
+        from nnFormer.nnFormer_seg import nnFormer
+        model = nnFormer(crop_size=img_size,
+                    embedding_dim=48,
+                    input_channels=1,
+                    num_classes=1,
+                    depths=[2,2,2,2],
+                    num_heads=[6, 12, 24, 48]).to(device)
+    else:
+        raise ValueError(f"Unsupported model name: {model_name}")
     return model
 
 
@@ -654,7 +678,7 @@ def train_and_validate(train_ds: PatchDataset, val_ds: PatchDataset):
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    model = make_model().to(DEVICE)
+    model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     mse = nn.MSELoss()
@@ -681,6 +705,9 @@ def train_and_validate(train_ds: PatchDataset, val_ds: PatchDataset):
             torch.cuda.reset_peak_memory_stats()
         except Exception:
             pass
+
+    # Ensure model directory exists for per-epoch checkpoints
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -756,6 +783,26 @@ def train_and_validate(train_ds: PatchDataset, val_ds: PatchDataset):
         try:
             plot_curves(train_hist, val_hist, CURVE_PNG)
         except Exception:
+            pass
+
+        # Save checkpoint every epoch
+        try:
+            ckpt_path = os.path.join(MODEL_DIR, f"dynunet_{RUN_ID}_epoch{epoch:03d}.pt")
+            torch.save({
+                'model_state': model.state_dict(),
+                'run_id': RUN_ID,
+                'epoch': epoch,
+                'config': {
+                    'patch_size': PATCH_SIZE,
+                    'patch_stride': PATCH_STRIDE,
+                    'epochs': EPOCHS,
+                    'lr': LR,
+                    'weight_decay': WEIGHT_DECAY,
+                    'loss_weights': (LOSS_MSE_W, LOSS_SSIM_W),
+                }
+            }, ckpt_path)
+        except Exception:
+            # best-effort checkpointing; continue training on failure
             pass
 
     return model, inferer, train_hist, val_hist
