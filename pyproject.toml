@@ -14,7 +14,10 @@ dependencies = [
   "SimpleITK>=2.2",
   "monai>=1.3.0",
   "torch>=2.1.0",
-  "tqdm>=4.64"
+  "tqdm>=4.64",
+  "batchgenerators>=0.25",
+  "timm>=0.6.12",  # add zarr
+  "zarr>=2.4.0",  # i think version is ok
 ]
 
 [tool.setuptools]

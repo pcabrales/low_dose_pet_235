@@ -11,10 +11,10 @@ Inputs:
 
 Behavior:
 - Picks only files whose DRF matches --drf
-- Normalizes per volume (z-score), runs sliding-window inference with
-  96x96x96 patches and stride 48 (50% overlap), averages overlaps.
-- De-normalizes and keeps final values in Bq/ml (BQML). If CSV ImageUnits
-  is already BQML, no additional scaling is applied.
+- Normalizes per subject using robust min–max: map [p1, p99] -> [0,1],
+  runs sliding-window inference with 96x96x96 patches and stride 48 (50% overlap), averages overlaps.
+- De-normalizes back to original domain via p1 + out*(p99-p1), then keeps
+  final values in Bq/ml (BQML). If CSV ImageUnits is already BQML, no additional scaling is applied.
 - Saves outputs to /root/PET_LOWDOSE/TEST_DATA/PET_Nifti/quadra-output
   with the same filename as input.
 - Also saves 3 visualization grids via the plotting helper in train_dynunet.py.
@@ -53,6 +53,7 @@ from train_dynunet import (
     DEVICE,
     FIG_DIR,
     write_nifti,
+    minmax_percentile_scale,
 )
 
 
@@ -88,16 +89,16 @@ def read_nifti(path: str) -> Tuple[np.ndarray, Dict]:
     return arr, meta
 
 
-def sliding_window_predict(vol_z: np.ndarray, model: torch.nn.Module) -> np.ndarray:
-    """Predict full volume with 50% overlap averaging.
+def sliding_window_predict(vol_mm: np.ndarray, model: torch.nn.Module) -> np.ndarray:
+    """Predict full volume with 50% overlap averaging in [0,1] space.
 
     Args:
-        vol_z: z-scored volume [D,H,W]
+        vol_mm: min–max normalized volume [D,H,W]
         model: torch model (eval mode)
     Returns:
-        predicted z-scored volume [D,H,W]
+        predicted normalized volume [D,H,W]
     """
-    d, h, w = vol_z.shape
+    d, h, w = vol_mm.shape
     pd, ph, pw = PATCH_SIZE
     sd, sh, sw = STRIDE
 
@@ -108,7 +109,7 @@ def sliding_window_predict(vol_z: np.ndarray, model: torch.nn.Module) -> np.ndar
 
     with torch.no_grad():
         for (z, y, x) in coords:
-            patch = vol_z[z:z+pd, y:y+ph, x:x+pw]
+            patch = vol_mm[z:z+pd, y:y+ph, x:x+pw]
             xt = torch.from_numpy(patch)[None, None].to(DEVICE)
             pred = model(xt)
             pnp = pred[0, 0].float().detach().cpu().numpy()
@@ -188,18 +189,19 @@ def main():
         in_path = os.path.join(args.input_dir, fname)
         vol, meta = read_nifti(in_path)  # [D,H,W]
 
-        # Per-volume z-score
-        m = float(np.mean(vol))
-        s = float(np.std(vol))
-        if s <= 1e-6:
-            s = 1.0
-        vol_z = (vol - m) / s
+        # Robust percentiles per subject
+        p1 = float(np.percentile(vol, 1.0))
+        p99 = float(np.percentile(vol, 99.0))
+        scale = float(max(1e-6, p99 - p1))
 
-        # Sliding-window prediction (z-space)
-        pred_z = sliding_window_predict(vol_z, model)
+        # Min–max normalize
+        vol_mm = minmax_percentile_scale(vol, p1, p99)
 
-        # De-normalize
-        pred = pred_z * s + m
+        # Sliding-window prediction in [0,1]
+        pred_mm = sliding_window_predict(vol_mm, model)
+
+        # De-normalize back to original domain
+        pred = pred_mm * scale + p1
 
         # Keep Bq/ml (BQML) units using CSV (no-op if already BQML)
         units = (row.get("ImageUnits") or "").strip().upper()
@@ -224,11 +226,11 @@ def main():
 
         # Collect up to 3 cases for visualization. Use input as 'target' to view diffs.
         if len(vis_patients) < 3:
-            # Re-create arrays expected by plotter: z-scored
+            # Re-create arrays expected by plotter: min–max normalized
             pitem = PatientItem(
                 pid=os.path.splitext(os.path.splitext(fname)[0])[0],
-                input_arr=vol_z.astype(np.float32, copy=False),
-                target_arr=vol_z.astype(np.float32, copy=False),  # use input as pseudo-target
+                input_arr=vol_mm.astype(np.float32, copy=False),
+                target_arr=vol_mm.astype(np.float32, copy=False),  # use input as pseudo-target
                 input_meta=meta,
                 target_meta=meta,
             )
@@ -244,4 +246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

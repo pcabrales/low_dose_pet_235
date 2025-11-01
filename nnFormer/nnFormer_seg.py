@@ -3,7 +3,7 @@
 from torch import nn
 import torch
 import numpy as np
-from models.nnFormer.neural_network import SegmentationNetwork
+from nnFormer.neural_network import SegmentationNetwork
 import torch.nn.functional
 import torch.nn.functional as F
 from timm.models.layers import DropPath, to_3tuple, trunc_normal_
