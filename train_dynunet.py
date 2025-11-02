@@ -89,7 +89,7 @@ VAL_FRACTION = 0.05
 RANDOM_SEED = 42
 
 BATCH_SIZE = 8  ###
-EPOCHS = 15  ###
+EPOCHS = 25  ###15  ###
 LR = 5e-5  ###1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -1063,10 +1063,10 @@ class LazyPatchDataset(Dataset):
 
 def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96, 96, 96)) -> nn.Module:
     if model_name.lower() == "dynunet":
-        kernel_size = [[3, 3, 3]] * 5
-        strides = [1, 2, 2, 2, 2]
-        up_kernels = [2, 2, 2, 2]
-        # add to make the model larger: filters=[16, 32, 64, 128, 256, 512]
+        kernel_size = [[3, 3, 3]] * 6  #5
+        strides = [1, 2, 2, 2, 2, 2]
+        up_kernels = [2, 2, 2, 2, 2, 2]  ### 6 layers now, before it was 5
+        # add to make the model larger: filters=[8, 16, 32, 64, 128, 256], 512]
         model = DynUNet(
             spatial_dims=3,
             in_channels=1,
@@ -1074,6 +1074,7 @@ def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96
             kernel_size=kernel_size,
             strides=strides,
             upsample_kernel_size=up_kernels,
+            filters=[16, 32, 64, 128, 256, 512], ###
             norm_name=("instance", {"affine": True}),
             act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
             deep_supervision=False,
