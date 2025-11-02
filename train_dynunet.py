@@ -80,31 +80,35 @@ RUN_ID_BASE = RUN_ID
 
 # Default to DynUNet per README; nnFormer is much heavier
 MODEL_NAME = "dynunet"  ### choices: "DynUNet" or "nnFormer"
-PATCH_SIZE = (128, 128, 128)  ###(96, 96, 96)  ###(80, 80, 80)
+PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128)  (96, 96, 96)  ###(80, 80, 80)
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
-PATCH_STRIDE = (96, 96, 96)  ###(80, 80, 80)  ###(64, 64, 64)
+PATCH_STRIDE =   (80, 80, 80)  #(48, 48, 48) (96, 96, 96)  (80, 80, 80)  ###(64, 64, 64)
 
-MAX_PATIENTS = 10  ###None  ### set to an int to limit for quick tests
+MAX_PATIENTS = None  ### set to an int to limit for quick tests
 VAL_FRACTION = 0.05  
 RANDOM_SEED = 42
 
-BATCH_SIZE = 16  ###
-EPOCHS = 3  ###15  ###
-LR = 1e-4
+BATCH_SIZE = 8  ###
+EPOCHS = 15  ###
+LR = 5e-5  ###1e-4
 WEIGHT_DECAY = 1e-5
 
 LOSS_MSE_W = 0.9
 LOSS_SSIM_W = 0.1
 
+# Robust scaling percentiles used for [0,1] normalization
+PCT_LOW = 0.1
+PCT_HIGH = 99.9
+
 CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-# Enable matmul acceleration on Ampere+ GPUs (helps nnFormer/attention)
-try:
-    torch.set_float32_matmul_precision("medium")
-except Exception:
-    pass
+### Enable matmul acceleration on Ampere+ GPUs (helps nnFormer/attention)
+# try:
+#     torch.set_float32_matmul_precision("medium")
+# except Exception:
+#     pass
 
 # Use tuned convolution algorithms when input shapes are static
 try:
@@ -347,7 +351,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
                             "file": f"{pid}__full.zarr",  # for reference
                             "shape": f"{s[0]}|{s[1]}|{s[2]}",
                             "spacing": "", "origin": "", "direction": "",
-                            "p1": "", "p99": "",
+                            "p001": "", "p999": "",
                         })
                     except Exception:
                         pass
@@ -369,7 +373,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
                                 "file": f"{pid}__drf{drf}.zarr",
                                 "shape": f"{s[0]}|{s[1]}|{s[2]}",
                                 "spacing": "", "origin": "", "direction": "",
-                                "p1": "", "p99": "",
+                                "p001": "", "p999": "",
                             })
                         except Exception:
                             pass
@@ -378,7 +382,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
             if rows:
                 with open(meta_csv_path, "w", newline="") as f:
                     w = csv.DictWriter(f, fieldnames=[
-                        "pid", "series", "drf", "file", "shape", "spacing", "origin", "direction", "p1", "p99"
+                        "pid", "series", "drf", "file", "shape", "spacing", "origin", "direction", "p001", "p999"
                     ])
                     w.writeheader()
                     for r in rows:
@@ -403,6 +407,7 @@ class PatientItem:
 class NpyEntry:
     """Lightweight descriptor for a patient pair stored as NPY files."""
     pid: str
+    drf: int
     in_path: str
     tg_path: str
     pair_shape: Tuple[int, int, int]  # min dims (D,H,W) across input/target
@@ -414,6 +419,7 @@ class NpyEntry:
 class ZarrEntry:
     """Descriptor for a patient pair stored as Zarr arrays."""
     pid: str
+    drf: int
     in_path: str
     tg_path: str
     pair_shape: Tuple[int, int, int]
@@ -458,14 +464,21 @@ def load_metadata_index(meta_csv_path: str = META_CSV) -> Dict[Tuple[str, str, s
                 key = (row.get("series", ""), row.get("pid", ""), row.get("drf", ""))
                 if not key[0] or not key[1] or not key[2]:
                     continue
+                # Prefer p001/p999 if present; fall back to p1/p99 for backward compatibility
+                p_low = _parse_float(row.get("p001", ""))
+                p_high = _parse_float(row.get("p999", ""))
+                if p_low is None and p_high is None:
+                    p_low = _parse_float(row.get("p1", ""))
+                    p_high = _parse_float(row.get("p99", ""))
                 idx[key] = {
                     "file": row.get("file", ""),
                     "shape": row.get("shape", ""),
                     "spacing": _parse_vec(row.get("spacing", "")),
                     "origin": _parse_vec(row.get("origin", "")),
                     "direction": _parse_vec(row.get("direction", "")),
-                    "p1": _parse_float(row.get("p1", "")),
-                    "p99": _parse_float(row.get("p99", "")),
+                    # Maintain keys 'p1'/'p99' in-memory for simplicity
+                    "p1": p_low,
+                    "p99": p_high,
                 }
     except Exception as e:
         print(f"Warning: failed to read metadata.csv: {e}")
@@ -488,6 +501,7 @@ def build_npy_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[str
         pair_shape = (min(in_shape[0], tg_shape[0]), min(in_shape[1], tg_shape[1]), min(in_shape[2], tg_shape[2]))
         entries.append(NpyEntry(
             pid=pid,
+            drf=drf,
             in_path=os.path.join(npy_root, in_rec["file"]),
             tg_path=os.path.join(npy_root, tg_rec["file"]),
             pair_shape=pair_shape,
@@ -528,6 +542,7 @@ def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[st
                     )
                     entries.append(ZarrEntry(
                         pid=pid,
+                        drf=drf,
                         in_path=in_z,
                         tg_path=tg_z,
                         pair_shape=pair_shape,
@@ -557,6 +572,7 @@ def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[st
             continue
         entries.append(ZarrEntry(
             pid=pid,
+            drf=drf,
             in_path=in_z,
             tg_path=tg_z,
             pair_shape=pair_shape,
@@ -576,6 +592,124 @@ def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[st
             },
         ))
     return entries
+
+
+def _persist_percentiles_for_entries(entries: List[ZarrEntry], meta_csv_path: str):
+    """Compute robust percentiles (PCT_LOW/PCT_HIGH) from target volumes and persist into metadata.csv.
+
+    - Computes once per patient (uses target full-dose array).
+    - Stores into columns 'p001' and 'p999'.
+    - Updates rows for both target ('full') and each input DRF present.
+    - Updates in-memory entry metadata for immediate use this run.
+    """
+    if not entries:
+        return
+
+    # 1) Compute percentiles per patient using target zarr
+    per_pid: Dict[str, Tuple[float, float]] = {}
+    inputs_per_pid: Dict[str, List[Tuple[int, str]]] = {}
+    tg_path_per_pid: Dict[str, str] = {}
+    for e in entries:
+        tg_path_per_pid[e.pid] = e.tg_path
+        inputs_per_pid.setdefault(e.pid, []).append((e.drf, e.in_path))
+    for pid, tg_path in tg_path_per_pid.items():
+        try:
+            arr = zarr.open(tg_path, mode="r")
+            a = np.asarray(arr[:])
+            p1 = float(np.percentile(a, PCT_LOW))
+            p99 = float(np.percentile(a, PCT_HIGH))
+        except Exception:
+            p1, p99 = 0.0, 1.0
+        per_pid[pid] = (p1, p99)
+
+    # 2) Update in-memory entry metadata so dataset normalizes without recomputing
+    for e in entries:
+        p1, p99 = per_pid.get(e.pid, (None, None))
+        if p1 is not None and p99 is not None:
+            e.tg_meta["p1"], e.tg_meta["p99"] = p1, p99
+            e.in_meta["p1"], e.in_meta["p99"] = p1, p99
+
+    # 3) Read existing metadata rows (if any)
+    rows: List[Dict[str, str]] = []
+    fieldnames: List[str] = [
+        "pid", "series", "drf", "file", "shape", "spacing", "origin", "direction", "p001", "p999"
+    ]
+    existing: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+    if os.path.isfile(meta_csv_path):
+        try:
+            with open(meta_csv_path, "r", newline="") as f:
+                r = csv.DictReader(f)
+                rows = [dict(row) for row in r]
+                # Preserve any additional columns
+                for fn in r.fieldnames or []:
+                    if fn not in fieldnames:
+                        fieldnames.append(fn)
+                for row in rows:
+                    key = (row.get("series", ""), row.get("pid", ""), row.get("drf", ""))
+                    existing[key] = row
+        except Exception:
+            rows = []
+            existing = {}
+
+    # 4) Upsert rows for each pid (target + inputs)
+    def _shape_str(zpath: str) -> str:
+        try:
+            za = zarr.open(zpath, mode="r")
+            s = za.shape
+            return f"{s[0]}|{s[1]}|{s[2]}"
+        except Exception:
+            return ""
+
+    for pid, (p1, p99) in per_pid.items():
+        # target row
+        tkey = ("target", pid, "full")
+        trow = existing.get(tkey)
+        if not trow:
+            trow = {
+                "pid": pid,
+                "series": "target",
+                "drf": "full",
+                "file": os.path.basename(tg_path_per_pid.get(pid, "")),
+                "shape": _shape_str(tg_path_per_pid.get(pid, "")),
+                "spacing": "", "origin": "", "direction": "",
+            }
+            rows.append(trow)
+            existing[tkey] = trow
+        trow["p001"] = f"{p1:.6g}"
+        trow["p999"] = f"{p99:.6g}"
+
+        # inputs
+        for drf, in_path in inputs_per_pid.get(pid, []):
+            ikey = ("input", pid, str(drf))
+            irow = existing.get(ikey)
+            if not irow:
+                irow = {
+                    "pid": pid,
+                    "series": "input",
+                    "drf": str(drf),
+                    "file": os.path.basename(in_path),
+                    "shape": _shape_str(in_path),
+                    "spacing": "", "origin": "", "direction": "",
+                }
+                rows.append(irow)
+                existing[ikey] = irow
+            # Store same subject-level percentiles for input (shared normalization)
+            irow["p001"] = f"{p1:.6g}"
+            irow["p999"] = f"{p99:.6g}"
+
+    # 5) Write back
+    try:
+        with open(meta_csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in rows:
+                # ensure columns exist
+                for k in fieldnames:
+                    row.setdefault(k, "")
+                w.writerow(row)
+        print(f"Updated metadata percentiles (p001/p999): {meta_csv_path}")
+    except Exception as e:
+        print(f"Warning: failed writing metadata percentiles: {e}")
 
 
 def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Dict], pid: str, drf: int) -> PatientItem:
@@ -610,8 +744,8 @@ def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Di
     if p1 is None or p99 is None:
         # Fallback compute on the fly
         try:
-            p1 = float(np.percentile(tgt_vol, 1.0))
-            p99 = float(np.percentile(tgt_vol, 99.0))
+            p1 = float(np.percentile(tgt_vol, PCT_LOW))
+            p99 = float(np.percentile(tgt_vol, PCT_HIGH))
         except Exception:
             p1, p99 = 0.0, 1.0
     in_vol = minmax_percentile_scale(in_vol, float(p1), float(p99)).astype(np.float32, copy=False)
@@ -658,8 +792,8 @@ def load_patient_from_zarr(zarr_root: str, meta_idx: Dict[Tuple[str, str, str], 
     p99 = tg_rec.get("p99") if (tg_rec.get("p99") is not None) else in_rec.get("p99")
     if p1 is None or p99 is None:
         try:
-            p1 = float(np.percentile(tgt_vol, 1.0))
-            p99 = float(np.percentile(tgt_vol, 99.0))
+            p1 = float(np.percentile(tgt_vol, PCT_LOW))
+            p99 = float(np.percentile(tgt_vol, PCT_HIGH))
         except Exception:
             p1, p99 = 0.0, 1.0
     in_vol = minmax_percentile_scale(in_vol, float(p1), float(p99)).astype(np.float32, copy=False)
@@ -725,6 +859,17 @@ def random_augment(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torc
             x = torch.rot90(x, k, dims=(1, 2))
             y = torch.rot90(y, k, dims=(1, 2))
     return x, y
+
+
+def _seed_worker(worker_id: int):
+    """Ensure each DataLoader worker gets a unique Python and NumPy RNG seed.
+
+    Keeps reproducibility anchored to torch's initial seed while avoiding identical
+    augmentations across workers.
+    """
+    seed = torch.initial_seed() % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 class PatchDataset(Dataset):
@@ -849,8 +994,8 @@ class LazyPatchDataset(Dataset):
                     arr = np.asarray(src[:])
                 else:
                     arr = np.asarray(src)
-                p1 = float(np.percentile(arr, 1.0))
-                p99 = float(np.percentile(arr, 99.0))
+                p1 = float(np.percentile(arr, PCT_LOW))
+                p99 = float(np.percentile(arr, PCT_HIGH))
                 e.tg_meta["p1"], e.tg_meta["p99"] = p1, p99
         except Exception:
             pass
@@ -970,7 +1115,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    mse = nn.MSELoss()
+    mse = nn.L1Loss() ###nn.MSELoss()
     ssim = SSIMLoss(spatial_dims=3, data_range=1.0)  # min-max scaled to [0,1]
 
     # MONAI sliding window inferer for validation/inference
@@ -979,6 +1124,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     # Keep worker count modest to avoid CPU thrash from IO/decompression
     # DataLoader tuning: more workers, pinned memory for faster H2D, and prefetching
     nw = max(2, min(8, (os.cpu_count() or 8)))
+    g = torch.Generator().manual_seed(RANDOM_SEED)
     loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -987,6 +1133,8 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
         pin_memory=(DEVICE.type == "cuda"),
         prefetch_factor=4,
         persistent_workers=True,
+        worker_init_fn=_seed_worker,
+        generator=g,
     )
     
 
@@ -1004,9 +1152,9 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     # Ensure model directory exists for per-epoch checkpoints
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # Mixed precision can significantly speed up training on GPUs
-    use_amp = DEVICE.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    ### # Mixed precision can significantly speed up training on GPUs
+    # use_amp = DEVICE.type == "cuda"
+    # scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -1046,14 +1194,27 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 skipped_empty += int((~keep).sum().item())
                 xb = xb[keep]
                 yb = yb[keep]
-                
+
+            assert torch.isfinite(xb).all() and torch.isfinite(yb).all()
+            
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                pred = model(xb)
-                l = LOSS_MSE_W * mse(pred, yb) + LOSS_SSIM_W * ssim(pred, yb)
-            scaler.scale(l).backward()
-            scaler.step(opt)
-            scaler.update()
+            ### with torch.cuda.amp.autocast(enabled=use_amp):
+            pred = model(xb)
+            # Constrain predictions to [0,1] for stable loss with [0,1]-scaled targets
+            ### pred = torch.sigmoid(pred)
+            l = LOSS_MSE_W * mse(pred, yb) + LOSS_SSIM_W * ssim(pred, yb)
+            
+            if not torch.isfinite(l):
+                raise ValueError(f"Non-finite loss {l.item()}, skipping batch")
+                
+            ### scaler.scale(l).backward()
+            # scaler.step(opt)
+            # scaler.update()
+            
+            ### changed scaler to
+            l.backward()
+            opt.step()
+            
             ep_loss += float(l.item())
             n_batches += 1
 
@@ -1089,6 +1250,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                     xt = torch.from_numpy(vp.input_arr).float()[None, None].to(DEVICE, non_blocking=True)
                     yt = torch.from_numpy(vp.target_arr).float()[None, None].to(DEVICE, non_blocking=True)
                     pred_full = inferer(xt, model)
+                    # pred_full = torch.sigmoid(pred_full)
                     lv = LOSS_MSE_W * mse(pred_full, yt) + LOSS_SSIM_W * ssim(pred_full, yt)
                     vloss_acc += float(lv.item())
                     vcount += 1
@@ -1105,7 +1267,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
 
         # Save checkpoint every epoch
         try:
-            ckpt_path = os.path.join(MODEL_DIR, f"dynunet_{RUN_ID}_epoch{epoch:03d}.pt")
+            ckpt_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}_{RUN_ID}_epoch{epoch:03d}.pt")
             torch.save({
                 'model_state': model.state_dict(),
                 'run_id': RUN_ID,
@@ -1131,7 +1293,8 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
 def mse_ssim_metrics(pred: torch.Tensor, target: torch.Tensor, ssim_loss: SSIMLoss) -> Tuple[float, float]:
     # tensors are [1,1,D,H,W]
     with torch.no_grad():
-        m = float(F.mse_loss(pred, target).item())
+        ### m = float(F.mse_loss(pred, target).item())
+        m = float(F.l1_loss(pred, target).item())
         # SSIMLoss returns (1 - ssim), so true SSIM = 1 - loss
         sl = float(ssim_loss(pred, target).item())
         ssim_val = 1.0 - sl
@@ -1147,13 +1310,14 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
             xt = torch.from_numpy(p.input_arr).float()[None, None].to(DEVICE)
             yt = torch.from_numpy(p.target_arr).float()[None, None].to(DEVICE)
             pred = inferer(xt, model)
+            # pred = torch.sigmoid(pred)
 
             # Metrics vs target (model) and baseline (input)
             m_mse, m_ssim = mse_ssim_metrics(pred, yt, ssim_eval)
             b_mse, b_ssim = mse_ssim_metrics(xt, yt, ssim_eval)
 
             # Save NIfTI
-            pred_np = pred[0, 0].cpu().numpy()
+            pred_np = pred[0, 0].float().clamp(0.0, 1.0).cpu().numpy()
             out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}_{RUN_ID}.nii.gz")
             try:
                 write_nifti(pred_np, p.input_meta, out_path)
@@ -1195,9 +1359,10 @@ def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patie
             xt = torch.from_numpy(p.input_arr).float()[None, None].to(DEVICE)
             yt = torch.from_numpy(p.target_arr).float()[None, None].to(DEVICE)
             pred = inferer(xt, model)
+            # pred = torch.sigmoid(pred)
             xnp = xt[0, 0].cpu().numpy()
             ynp = yt[0, 0].cpu().numpy()
-            pnp = pred[0, 0].cpu().numpy()
+            pnp = pred[0, 0].float().clamp(0.0, 1.0).cpu().numpy()
 
             # Coronal slice: fix X (W axis) at middle
             wmid = xnp.shape[2] // 2
@@ -1385,6 +1550,12 @@ def main():
     if not train_entries:
         print("No training patients available with required NPY pairs.")
         return
+
+    # Compute and persist robust percentiles (0.1/99.9) for subjects so next runs use them
+    try:
+        _persist_percentiles_for_entries(train_entries + val_entries, META_CSV)
+    except Exception as ex:
+        print(f"Warning: failed to persist percentiles: {ex}")
 
     train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True)
     print(f"Train patches: {len(train_ds)} across {len(train_entries)} patients")
