@@ -1,29 +1,21 @@
 #!/usr/bin/env python3
 """
-Apply a trained DynUNet model to NIfTI files for a given DRF.
+Inference script that matches train.py validation settings.
 
-Inputs:
-- Reads NIfTI volumes from /root/PET_LOWDOSE/TEST_DATA/PET_Nifti/quadra
-- Uses PET_INFO CSV at /root/PET_LOWDOSE/TEST_DATA/PET_info_noNORMAL.csv
-  - Second column: DoseReductionFactor (DRF)
-  - Third column: NiftiFileName
-  - Column RadionuclideTotalDose_Bq used to keep units consistent (BQML)
+What it does
+- Selects test NIfTI volumes of a chosen DRF from a CSV index.
+- Uses the same robust normalization as train.py (0.1/99.9 percentiles).
+- Runs MONAI's SlidingWindowInferer with the same ROI size as training
+  and high overlap (0.75) as used in train.py validation.
+- De-normalizes predictions back to the original intensity domain and saves
+  the results. If the CSV indicates BQML units, outputs represent Bq/mL.
+- Optionally renders a few example grids using train.py's plotter.
 
-Behavior:
-- Picks only files whose DRF matches --drf
-- Normalizes per subject using robust min–max: map [p1, p99] -> [0,1],
-  runs sliding-window inference with 96x96x96 patches and stride 48 (50% overlap), averages overlaps.
-- De-normalizes back to original domain via p1 + out*(p99-p1), then keeps
-  final values in Bq/ml (BQML). If CSV ImageUnits is already BQML, no additional scaling is applied.
-- Saves outputs to /root/PET_LOWDOSE/TEST_DATA/PET_Nifti/quadra-output
-  with the same filename as input.
-- Also saves 3 visualization grids via the plotting helper in train_dynunet.py.
-
-Minimal error handling by design.
+This script avoids any ad-hoc unit rescaling: it preserves the physical
+units of the input NIfTI volume; when inputs are in BQML, outputs are in BQML.
 """
 
 import os
-import sys
 import csv
 import argparse
 from typing import Dict, List, Tuple
@@ -31,38 +23,44 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
-try:
-    import SimpleITK as sitk
-except Exception as e:
-    print("SimpleITK is required.", file=sys.stderr)
-    raise
+import SimpleITK as sitk
+from monai.inferers import SlidingWindowInferer
 
-try:
-    from monai.inferers import SlidingWindowInferer
-except Exception as e:
-    print("MONAI is required.", file=sys.stderr)
-    raise
-
-# Import helpers and model definition from training script
-from train_dynunet import (
+# Import helpers, constants, and plotting from training script
+from train import (
     make_model,
-    compute_grid,
-    enumerate_patches,
     plot_val_examples,
     PatientItem,
     DEVICE,
     FIG_DIR,
     write_nifti,
     minmax_percentile_scale,
+    PATCH_SIZE,
+    # pretrained model paths and tuning per DRF
+    PRETRAINED_MODEL_100DRF,
+    NUM_LAYERS_100DRF,
+    FILTERS_100DRF,
+    PRETRAINED_MODEL_50DRF,
+    NUM_LAYERS_50DRF,
+    FILTERS_50DRF,
+    PRETRAINED_MODEL_20DRF,
+    NUM_LAYERS_20DRF,
+    FILTERS_20DRF,
+    PRETRAINED_MODEL_10DRF,
+    NUM_LAYERS_10DRF,
+    FILTERS_10DRF,
+    PRETRAINED_MODEL_4DRF,
+    NUM_LAYERS_4DRF,
+    FILTERS_4DRF,
+    PCT_LOW,
+    PCT_HIGH,
+    MODEL_NAME,
 )
 
 
 DEFAULT_INPUT_DIR = "/root/PET_LOWDOSE/TEST_DATA/PET_Nifti/quadra"
 DEFAULT_OUTPUT_DIR = "/root/PET_LOWDOSE/TEST_DATA/PET_Nifti/quadra-output"
 INFO_CSV = "/root/PET_LOWDOSE/TEST_DATA/PET_info_noNORMAL.csv"
-
-PATCH_SIZE = (96, 96, 96)
-STRIDE = (48, 48, 48)
 
 
 def load_csv_index(csv_path: str) -> Dict[str, Dict[str, str]]:
@@ -88,43 +86,32 @@ def read_nifti(path: str) -> Tuple[np.ndarray, Dict]:
     }
     return arr, meta
 
-
-def sliding_window_predict(vol_mm: np.ndarray, model: torch.nn.Module) -> np.ndarray:
-    """Predict full volume with 50% overlap averaging in [0,1] space.
-
-    Args:
-        vol_mm: min–max normalized volume [D,H,W]
-        model: torch model (eval mode)
-    Returns:
-        predicted normalized volume [D,H,W]
-    """
-    d, h, w = vol_mm.shape
-    pd, ph, pw = PATCH_SIZE
-    sd, sh, sw = STRIDE
-
-    coords = enumerate_patches((d, h, w), PATCH_SIZE, STRIDE)
-
-    out = np.zeros((d, h, w), dtype=np.float32)
-    cnt = np.zeros((d, h, w), dtype=np.float32)
-
-    with torch.no_grad():
-        for (z, y, x) in coords:
-            patch = vol_mm[z:z+pd, y:y+ph, x:x+pw]
-            xt = torch.from_numpy(patch)[None, None].to(DEVICE)
-            pred = model(xt)
-            pnp = pred[0, 0].float().detach().cpu().numpy()
-            out[z:z+pd, y:y+ph, x:x+pw] += pnp
-            cnt[z:z+pd, y:y+ph, x:x+pw] += 1.0
-
-    cnt = np.clip(cnt, 1e-6, None)
-    out /= cnt
-    return out
+def write_nifti_with_units(volume: np.ndarray, meta: Dict, out_path: str, units: str = ""):
+    """Write NIfTI with geometry from meta and annotate units in header 'descrip'."""
+    img = sitk.GetImageFromArray(volume.astype(np.float32, copy=False))
+    try:
+        if meta and "spacing" in meta:
+            img.SetSpacing(meta["spacing"])
+        if meta and "origin" in meta:
+            img.SetOrigin(meta["origin"])
+        if meta and "direction" in meta:
+            img.SetDirection(meta["direction"])
+    except Exception:
+        pass
+    try:
+        if units:
+            # best-effort annotation for downstream consumers
+            img.SetMetaData("descrip", f"Units={units}")
+    except Exception:
+        pass
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    sitk.WriteImage(img, out_path)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Apply trained DynUNet to test NIfTI volumes")
     ap.add_argument("--drf", type=int, required=True, help="Dose reduction factor to select (e.g., 4, 10, 20, 50, 100)")
-    ap.add_argument("--model", type=str, default="", help="Path to trained model .pt; if omitted, picks latest matching drf from trained-models/")
+    ap.add_argument("--model", type=str, default="", help="Path to trained model .pt; if omitted, uses train.py's pretrained model mapping for the DRF or falls back to the newest trained-models/ match")
     ap.add_argument("--input-dir", type=str, default=DEFAULT_INPUT_DIR)
     ap.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument("--csv", type=str, default=INFO_CSV)
@@ -132,24 +119,50 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Find model path
+    # Determine model path and architecture consistent with train.py validation
     model_path = args.model
+    num_layers = None
+    filters = None
     if not model_path:
-        tm_dir = os.path.join(os.path.dirname(__file__), "trained-models")
-        cand = []
-        if os.path.isdir(tm_dir):
-            for n in os.listdir(tm_dir):
-                if n.endswith(".pt") and f"drf{args.drf}" in n:
-                    cand.append(os.path.join(tm_dir, n))
-        if cand:
-            cand.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            model_path = cand[0]
+        # Prefer explicit pretrained mapping from train.py
+        if args.drf == 100:
+            model_path = PRETRAINED_MODEL_100DRF
+            num_layers = NUM_LAYERS_100DRF
+            filters = FILTERS_100DRF
+        elif args.drf == 50:
+            model_path = PRETRAINED_MODEL_50DRF
+            num_layers = NUM_LAYERS_50DRF
+            filters = FILTERS_50DRF
+        elif args.drf == 20:
+            model_path = PRETRAINED_MODEL_20DRF
+            num_layers = NUM_LAYERS_20DRF
+            filters = FILTERS_20DRF
+        elif args.drf == 10:
+            model_path = PRETRAINED_MODEL_10DRF
+            num_layers = NUM_LAYERS_10DRF
+            filters = FILTERS_10DRF
+        elif args.drf == 4:
+            model_path = PRETRAINED_MODEL_4DRF
+            num_layers = NUM_LAYERS_4DRF
+            filters = FILTERS_4DRF
+        else:
+            model_path = ""
+        # If mapping missing/empty, fall back to newest match in trained-models
+        if not model_path:
+            tm_dir = os.path.join(os.path.dirname(__file__), "trained-models")
+            cand = []
+            if os.path.isdir(tm_dir):
+                for n in os.listdir(tm_dir):
+                    if n.endswith(".pt") and f"drf{args.drf}" in n:
+                        cand.append(os.path.join(tm_dir, n))
+            if cand:
+                cand.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                model_path = cand[0]
     if not model_path:
-        print("No model specified and no matching trained-models/ file found.")
-        return
+        raise RuntimeError("No model specified and no matching pretrained model found for the requested DRF.")
 
     # Load model
-    model = make_model().to(DEVICE)
+    model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE, num_layers=(num_layers or 5), filters=filters).to(DEVICE)
     state = torch.load(model_path, map_location=DEVICE)
     if isinstance(state, dict) and "model_state" in state:
         model.load_state_dict(state["model_state"])
@@ -171,7 +184,7 @@ def main():
         try:
             drf_row = int(float(row.get("DoseReductionFactor", "")))
         except Exception:
-            continue
+            raise RuntimeError(f"Invalid DRF value in CSV for file {name}")
         if drf_row != args.drf:
             continue
         files.append((name, row))
@@ -180,8 +193,8 @@ def main():
         print(f"No NIfTI files found in {args.input_dir} for DRF={args.drf}.")
         return
 
-    # Prepare MONAI inferer for plotting helper only (uses its forward internally)
-    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.5, mode="gaussian")
+    # MONAI sliding window inferer matching train.py validation overlap
+    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.75, mode="gaussian")  ###0.75
 
     # Predict each file
     vis_patients: List[PatientItem] = []
@@ -189,40 +202,39 @@ def main():
         in_path = os.path.join(args.input_dir, fname)
         vol, meta = read_nifti(in_path)  # [D,H,W]
 
-        # Robust percentiles per subject
-        p1 = float(np.percentile(vol, 1.0))
-        p99 = float(np.percentile(vol, 99.0))
+        # Robust percentiles per subject consistent with train.py
+        p1 = float(np.percentile(vol, PCT_LOW))
+        p99 = float(np.percentile(vol, PCT_HIGH))
         scale = float(max(1e-6, p99 - p1))
 
-        # Min–max normalize
+        # Min–max normalize to [0,1]
         vol_mm = minmax_percentile_scale(vol, p1, p99)
+        print(vol_mm.sum())
 
-        # Sliding-window prediction in [0,1]
-        pred_mm = sliding_window_predict(vol_mm, model)
-
-        # De-normalize back to original domain
+        # Sliding-window prediction using MONAI inferer
+        with torch.no_grad():
+            xt = torch.from_numpy(vol_mm).float()[None, None].to(DEVICE)
+            pred_mm = inferer(xt, model)
+            pred_mm = pred_mm.clamp(0.0, None)
+            pred_mm = pred_mm[0, 0].float().cpu().numpy()
+        print(pred_mm.sum())
+        # De-normalize back to the input intensity domain
         pred = pred_mm * scale + p1
+        # print(f"Total dose input: {vol.sum():.2f} Bq") # *meta.get('spacing', (1,1,1))[0]*meta.get('spacing', (1,1,1))[1]*meta.get('spacing', (1,1,1))[2]
+        # print(f"Total dose output: {pred.sum():.2f} Bq")
 
-        # Keep Bq/ml (BQML) units using CSV (no-op if already BQML)
-        units = (row.get("ImageUnits") or "").strip().upper()
-        try:
-            dose_bq = float(row.get("RadionuclideTotalDose_Bq", 1.0))
-        except Exception:
-            dose_bq = 1.0
-        if units == "BQML":
-            scale = 1.0
-        else:
-            # Simple fallback if units differ: scale by dose (best-effort minimal behavior)
-            scale = float(dose_bq) if dose_bq > 0 else 1.0
-        pred_bqml = pred * scale
+        # Determine units from CSV; preserve BQML if already present
+        units_val = (row.get("ImageUnits") or row.get("Units") or "").strip().upper()
+        units_norm = "BQML" if ("BQML" in units_val or "BQ/ML" in units_val.replace(" ", "")) else units_val
 
-        # Save output NIfTI
+        # Save output NIfTI; annotate units in header description best-effort
         out_path = os.path.join(args.output_dir, fname)
         try:
-            write_nifti(pred_bqml, meta, out_path)
+            # write geometry + annotate units
+            write_nifti_with_units(pred, meta, out_path, units=units_norm)
         except Exception:
-            write_nifti(pred_bqml, {}, out_path)
-        print(f"Saved: {out_path}")
+            write_nifti_with_units(pred, {}, out_path, units=units_norm)
+        print(f"Saved: {out_path} (units: {units_norm or 'unknown'})")
 
         # Collect up to 3 cases for visualization. Use input as 'target' to view diffs.
         if len(vis_patients) < 3:
@@ -241,7 +253,7 @@ def main():
         os.makedirs(FIG_DIR, exist_ok=True)
         plot_val_examples(model, inferer, vis_patients, n=3)
     except Exception:
-        pass
+        print("Warning: failed to save visualization grids.")
 
 
 if __name__ == "__main__":

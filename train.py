@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal MONAI DynUNet training + inference script for low-dose PET.
+Minimal training + validation script for low-dose PET.
 
 Assumptions:
 - Input data is located under:
@@ -52,26 +52,24 @@ ZARR_ROOT = os.path.join(DATA_ROOT, "zarr")
 NPY_ROOT = "/dev/null/unused_npz_path"  # legacy (unused after Zarr migration)
 META_CSV = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects/metadata.csv"
 OUTPUT_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output"
-
 # Local artifact directories
 BASE_DIR = os.path.dirname(__file__)
 FIG_DIR = os.path.join(BASE_DIR, "figures")
 MODEL_DIR = os.path.join(BASE_DIR, "trained-models")
-RUN_ID = time.strftime("%Y%m%d_%H%M")  # updated later to include DRF
-RUN_ID_BASE = RUN_ID
 
-# Default to DynUNet per README; nnFormer is much heavier
 MODEL_NAME = "dynunet"  ### choices: "DynUNet" or "nnFormer"
 PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128)  (96, 96, 96)  ###(80, 80, 80)
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
 PATCH_STRIDE =   (80, 80, 80)  #(48, 48, 48) (96, 96, 96)  (80, 80, 80)  ###(64, 64, 64)
 
-MAX_PATIENTS = 5 ###None  ### set to an int to limit for quick tests
+MAX_PATIENTS = None  ### set to an int to limit for quick tests
 VAL_FRACTION = 0.05  
 RANDOM_SEED = 42
 
+FILTERS = [16, 32, 64, 128, 256, 512]
+NUM_LAYERS = len(FILTERS)
 BATCH_SIZE = 8  ###
-EPOCHS = 3 ###25  ###15  ###
+EPOCHS = 25  ###15  ###
 LR = 5e-5  ###1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -82,6 +80,24 @@ LOSS_SSIM_W = 0.1
 PCT_LOW = 0.1
 PCT_HIGH = 99.9
 
+PRETRAINED_MODEL_100DRF = os.path.join(MODEL_DIR, "dynunet_20251102_1852_drf100_epoch023.pt")
+FILTERS_100DRF = [32, 64, 128, 256, 512]
+NUM_LAYERS_100DRF = len(FILTERS_100DRF)
+PRETRAINED_MODEL_50DRF = os.path.join(MODEL_DIR, "dynunet_20251102_2132_drf50_epoch023.pt")
+FILTERS_50DRF = [16, 32, 64, 128, 256, 512]
+NUM_LAYERS_50DRF = len(FILTERS_50DRF)
+PRETRAINED_MODEL_20DRF = os.path.join(MODEL_DIR, "dynunet_20251102_1145_drf20_epoch014.pt")
+FILTERS_20DRF = [16, 32, 64, 128, 256]
+NUM_LAYERS_20DRF = len(FILTERS_20DRF)
+PRETRAINED_MODEL_10DRF = os.path.join(MODEL_DIR, "dynunet_20251102_0009_drf10_epoch014.pt")
+FILTERS_10DRF = None
+NUM_LAYERS_10DRF = 5
+PRETRAINED_MODEL_4DRF = os.path.join(MODEL_DIR, "dynunet_20251102_0009_drf4_epoch014.pt")
+FILTERS_4DRF = None
+NUM_LAYERS_4DRF = 5
+
+RUN_ID = time.strftime("%Y%m%d_%H%M")  # updated later to include DRF
+RUN_ID_BASE = RUN_ID
 CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -385,7 +401,7 @@ class ZarrEntry:
 
 
 def minmax_percentile_scale(x: np.ndarray, p1: float, p99: float) -> np.ndarray:
-    """Map [p1, p99] to [0, 1] and clamp outside.
+    """Map [p1, p99] to [0, 1]
 
     Assumes p99 > p1; falls back to zeros if not.
     """
@@ -393,7 +409,7 @@ def minmax_percentile_scale(x: np.ndarray, p1: float, p99: float) -> np.ndarray:
     if not np.isfinite(scale) or scale <= 1e-12:
         return np.zeros_like(x, dtype=np.float32)
     y = (x.astype(np.float32) - float(p1)) / scale
-    return np.clip(y, 0.0, 1.0, out=y)
+    return y  ###np.clip(y, 0.0, 1.0, out=y)
 
 
 def find_patients(data_root: str) -> List[str]:
@@ -997,32 +1013,49 @@ class LazyPatchDataset(Dataset):
 
 # ----------------------------- Model -----------------------------------
 
-def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96, 96, 96)) -> nn.Module:
+def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96, 96, 96),
+               num_layers: int = 5,
+               filters = None,
+               embedding_dim: int = 64) -> nn.Module:
     if model_name.lower() == "dynunet":
-        kernel_size = [[3, 3, 3]] * 6  #5
-        strides = [1, 2, 2, 2, 2, 2]
-        up_kernels = [2, 2, 2, 2, 2, 2]  ### 6 layers now, before it was 5
+        kernel_size = [[3, 3, 3]] * num_layers
+        strides = [1] + [2] * (num_layers - 1)
+        up_kernels = [2] * num_layers  # 6 layers now, before it was 5
         # add to make the model larger: filters=[8, 16, 32, 64, 128, 256], 512]
-        model = DynUNet(
-            spatial_dims=3,
-            in_channels=1,
-            out_channels=1,
-            kernel_size=kernel_size,
-            strides=strides,
-            upsample_kernel_size=up_kernels,
-            filters=[16, 32, 64, 128, 256, 512], ###
-            norm_name=("instance", {"affine": True}),
-            act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
-            deep_supervision=False,
-        )
+        if filters is not None:
+            model = DynUNet(
+                spatial_dims=3,
+                in_channels=1,
+                out_channels=1,
+                kernel_size=kernel_size,
+                strides=strides,
+                upsample_kernel_size=up_kernels,
+                filters=filters, ###
+                norm_name=("instance", {"affine": True}),
+                act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
+                deep_supervision=False,
+            )
+        else:
+            model = DynUNet(
+                spatial_dims=3,
+                in_channels=1,
+                out_channels=1,
+                kernel_size=kernel_size,
+                strides=strides,
+                upsample_kernel_size=up_kernels,
+                norm_name=("instance", {"affine": True}),
+                act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
+                deep_supervision=False,
+            )
     elif model_name.lower() == "nnformer":
         from nnFormer.nnFormer_seg import nnFormer
+        depths = [2] * num_layers
         model = nnFormer(crop_size=img_size,
-                    embedding_dim=64,
+                    embedding_dim=filters[-1],
                     input_channels=1,
                     num_classes=1,
-                    depths=[2,2,2,2],
-                    num_heads=[4, 8, 16, 32])
+                    depths=depths,
+                    num_heads=filters)
     else:
         raise ValueError(f"Unsupported model name: {model_name}")
     return model
@@ -1049,7 +1082,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE).to(DEVICE)
+    model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE, num_layers=NUM_LAYERS, filters=FILTERS).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     mse = nn.L1Loss() ###nn.MSELoss()
@@ -1118,7 +1151,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 p_max_z = flat.max(dim=1).values
                 # Threshold: if maximum of normalized patch [0,1] <= thresh 1% and not kept due to randomness, skip
                 thresh = 0.01
-                prob_keep_empty = 0.3
+                prob_keep_empty = 0.2  ###
                 keep = (p_max_z > thresh) | (
                     (p_max_z <= thresh) & (torch.rand_like(p_max_z) < prob_keep_empty)
                 )
@@ -1217,6 +1250,9 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                     'lr': LR,
                     'weight_decay': WEIGHT_DECAY,
                     'loss_weights': (LOSS_MSE_W, LOSS_SSIM_W),
+                    'NUM_LAYERS': NUM_LAYERS,
+                    'MODEL_NAME': MODEL_NAME,
+                    'FILTERS': FILTERS,
                 }
             }, ckpt_path)
         except Exception:
@@ -1237,7 +1273,7 @@ def mse_ssim_metrics(pred: torch.Tensor, target: torch.Tensor, ssim_loss: SSIMLo
         return m, ssim_val
 
 
-def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: List[PatientItem]):
+def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: List[PatientItem], save_nifti: bool = True):
     model.eval()
     ssim_eval = SSIMLoss(spatial_dims=3, data_range=1.0)
     rows = []
@@ -1246,6 +1282,11 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
             xt = torch.from_numpy(p.input_arr).float()[None, None].to(DEVICE)
             yt = torch.from_numpy(p.target_arr).float()[None, None].to(DEVICE)
             pred = inferer(xt, model)
+            # clamp to [0, unbounded]
+            pred = pred.clamp(0.0, None)
+            
+            print(f"Input sum = {xt.sum().item():.2f}, Target sum = {yt.sum().item():.2f}, Pred sum = {pred.sum().item():.2f}")
+            
             # pred = torch.sigmoid(pred)
 
             # Metrics vs target (model) and baseline (input)
@@ -1253,14 +1294,15 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
             b_mse, b_ssim = mse_ssim_metrics(xt, yt, ssim_eval)
 
             # Save NIfTI
-            pred_np = pred[0, 0].float().clamp(0.0, 1.0).cpu().numpy()
             out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}_{RUN_ID}.nii.gz")
-            try:
-                write_nifti(pred_np, p.input_meta, out_path)
-            except Exception:
-                print(f"Warning: failed writing NIfTI metadata for pid={p.pid}")
-                # fallback without metadata
-                write_nifti(pred_np, {}, out_path)
+            if save_nifti:
+                pred_np = pred[0, 0].float().clamp(0.0, None).cpu().numpy()
+                try:
+                    write_nifti(pred_np, p.input_meta, out_path)
+                except Exception:
+                    print(f"Warning: failed writing NIfTI metadata for pid={p.pid}")
+                    # fallback without metadata
+                    write_nifti(pred_np, {}, out_path)
 
             print(f"Saved: {out_path} | model MSE={m_mse:.4f} SSIM={m_ssim:.4f} | baseline MSE={b_mse:.4f} SSIM={b_ssim:.4f}")
             rows.append((p.pid, m_mse, m_ssim, b_mse, b_ssim))
@@ -1299,7 +1341,7 @@ def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patie
             # pred = torch.sigmoid(pred)
             xnp = xt[0, 0].cpu().numpy()
             ynp = yt[0, 0].cpu().numpy()
-            pnp = pred[0, 0].float().clamp(0.0, 1.0).cpu().numpy()
+            pnp = pred[0, 0].float().clamp(0.0, None).cpu().numpy()
 
             # Coronal slice: fix X (W axis) at middle
             wmid = xnp.shape[2] // 2
@@ -1446,9 +1488,10 @@ def infer_full_volume(x: torch.Tensor, model: nn.Module, roi_size: Tuple[int, in
     return out
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DynUNet for low-dose PET denoising")
+    parser = argparse.ArgumentParser(description="Train model for low-dose PET denoising")
     parser.add_argument("--drf", type=int, choices=[2, 4, 10, 20, 50, 100], default=10, help="Dose reduction factor (input folder '1-<DRF> dose')")
     parser.add_argument("--model", type=str, choices=["DynUNet", "nnFormer"], default=MODEL_NAME, help="Model architecture to use")
+    parser.add_argument("--validate", action="store_true", help="Run validation only (no training)")
     args = parser.parse_args()
 
     # Update run identifier to include DRF, and derived artifact paths
@@ -1475,18 +1518,18 @@ def main():
     n_val = max(1, int(len(all_pids) * VAL_FRACTION))
     val_pids = sorted(all_pids[:n_val])
     train_pids = sorted(all_pids[n_val:])
-    if not train_pids:  # ensure at least one in train
-        train_pids = val_pids
-        val_pids = []
+    if not train_pids:
+        raise RuntimeError("No training patients available after split; reduce VAL_FRACTION or add more data.")
 
     print(f"Patients: train={len(train_pids)} val={len(val_pids)} total={len(all_pids)}")
 
     # Build Zarr entries and lazy patch dataset for training
-    train_entries = build_zarr_entries(meta_idx, train_pids, args.drf, ZARR_ROOT)
-    val_entries = build_zarr_entries(meta_idx, val_pids, args.drf, ZARR_ROOT)
-    if not train_entries:
-        print("No training patients available with required NPY pairs.")
-        return
+    val_entries = build_zarr_entries(meta_idx, val_pids, args.drf, ZARR_ROOT) 
+    if args.validate:
+        print("Validation only mode; skipping training dataset preparation.")
+        train_entries = []
+    else:
+        train_entries = build_zarr_entries(meta_idx, train_pids, args.drf, ZARR_ROOT)
 
     # Compute and persist robust percentiles (0.1/99.9) for subjects so next runs use them
     try:
@@ -1494,8 +1537,9 @@ def main():
     except Exception as ex:
         print(f"Warning: failed to persist percentiles: {ex}")
 
-    train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True)
-    print(f"Train patches: {len(train_ds)} across {len(train_entries)} patients")
+    if not args.validate:
+        train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True)
+        print(f"Train patches: {len(train_ds)} across {len(train_entries)} patients")
 
     # Build full volumes for validation (smaller set) just-in-time
     print(f"Val patients: {len(val_entries)}")
@@ -1507,31 +1551,69 @@ def main():
         except Exception as ex:
             print(f"Warning: skipping val {e.pid}: {ex}")
 
-    # Train
-    model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_patients)
+    if args.validate:
+        if args.drf == 100:
+            model_path = PRETRAINED_MODEL_100DRF
+            num_layers = NUM_LAYERS_100DRF
+            filters = FILTERS_100DRF
+        elif args.drf == 50:
+            model_path = PRETRAINED_MODEL_50DRF
+            num_layers = NUM_LAYERS_50DRF
+            filters = FILTERS_50DRF
+        elif args.drf == 20:
+            model_path = PRETRAINED_MODEL_20DRF
+            num_layers = NUM_LAYERS_20DRF
+            filters = FILTERS_20DRF
+        elif args.drf == 10:
+            model_path = PRETRAINED_MODEL_10DRF
+            num_layers = NUM_LAYERS_10DRF
+            filters = FILTERS_10DRF
+        elif args.drf == 4:
+            model_path = PRETRAINED_MODEL_4DRF
+            num_layers = NUM_LAYERS_4DRF
+            filters = FILTERS_4DRF
+        else:
+            raise ValueError(f"No pretrained model available for DRF={args.drf}")
+        
+        # Load model
+        model = make_model(model_name=args.model, img_size=PATCH_SIZE, num_layers=num_layers, filters=filters).to(DEVICE)
+        state = torch.load(model_path, map_location=DEVICE)
+        if isinstance(state, dict) and "model_state" in state:
+            model.load_state_dict(state["model_state"])
+        else:
+            model.load_state_dict(state)
+        model.eval()
+        # MONAI sliding window inferer for validation
+        inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.75, mode="gaussian")  ###
+    else:
+        # Train
+        model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_patients)
 
-    # Save trained model with run id
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, f"dynunet_{RUN_ID}.pt")
-    try:
-        torch.save({
-            'model_state': model.state_dict(),
-            'run_id': RUN_ID,
-            'config': {
-                'patch_size': PATCH_SIZE,
-                'patch_stride': PATCH_STRIDE,
-                'epochs': EPOCHS,
-                'lr': LR,
-                'weight_decay': WEIGHT_DECAY,
-                'loss_weights': (LOSS_MSE_W, LOSS_SSIM_W),
-            }
-        }, model_path)
-        print(f"Saved model: {model_path}")
-    except Exception as e:
-        print(f"Failed to save model: {e}")
+        # Save trained model with run id
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        model_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}_{RUN_ID}.pt")
+        try:
+            torch.save({
+                'model_state': model.state_dict(),
+                'run_id': RUN_ID,
+                'config': {
+                    'patch_size': PATCH_SIZE,
+                    'patch_stride': PATCH_STRIDE,
+                    'epochs': EPOCHS,
+                    'lr': LR,
+                    'weight_decay': WEIGHT_DECAY,
+                    'loss_weights': (LOSS_MSE_W, LOSS_SSIM_W),
+                    'NUM_LAYERS': NUM_LAYERS,
+                    'MODEL_NAME': MODEL_NAME,
+                    'FILTERS': FILTERS
+                }
+            }, model_path)
+            print(f"Saved model: {model_path}")
+        except Exception as e:
+            print(f"Failed to save model: {e}")
 
     # Save outputs for val
-    save_all_outputs(model, inferer, val_patients)
+    save_all_outputs(model, inferer, val_patients, save_nifti=False)
 
     # Plot up to three validation examples (coronal slice grids)
     plot_val_examples(model, inferer, val_patients, n=3)
