@@ -28,16 +28,14 @@ from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 
 import numpy as np
+import zarr
+from numcodecs import Blosc
 try:
-    import zarr
-    from numcodecs import Blosc
-    try:
-        from zarr.storage import DirectoryStore as _DirectoryStore
-    except Exception:
-        _DirectoryStore = None
-except Exception as e:
-    print("Zarr and numcodecs are required for Zarr-based IO.", file=sys.stderr)
-    raise
+    from zarr.storage import DirectoryStore as _DirectoryStore
+    print("HERE")
+except Exception:
+    raise ValueError("Zarr DirectoryStore not available.")
+    _DirectoryStore = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,7 +82,7 @@ PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128)  (96, 96, 96)  ###(80
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
 PATCH_STRIDE =   (80, 80, 80)  #(48, 48, 48) (96, 96, 96)  (80, 80, 80)  ###(64, 64, 64)
 
-MAX_PATIENTS = None  ### set to an int to limit for quick tests
+MAX_PATIENTS = 5 ###None  ### set to an int to limit for quick tests
 VAL_FRACTION = 0.05  
 RANDOM_SEED = 42
 
@@ -230,12 +228,7 @@ def _zarr_write_array(zpath: str, arr: np.ndarray, meta: Dict):
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
     # Prefer Zarr v2 store if available; otherwise use path-based open
     try:
-        if _DirectoryStore is not None:
-            store = _DirectoryStore(zpath)
-            z = zarr.create(store=store, shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
-                            compressor=compressor, overwrite=True, zarr_format=2)
-        else:
-            z = zarr.open(zpath, mode="w", shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
+        z = zarr.open(zpath, mode="w", shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
                           compressor=compressor, zarr_format=2)
     except TypeError:
         # Signature differences or zarr_format not supported. Try without zarr_format (v2 default).
