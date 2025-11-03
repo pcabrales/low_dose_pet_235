@@ -30,12 +30,6 @@ from tqdm import tqdm
 import numpy as np
 import zarr
 from numcodecs import Blosc
-try:
-    from zarr.storage import DirectoryStore as _DirectoryStore
-    print("HERE")
-except Exception:
-    raise ValueError("Zarr DirectoryStore not available.")
-    _DirectoryStore = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,20 +38,10 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-try:
-    import SimpleITK as sitk
-except Exception as e:
-    print("SimpleITK is required but not installed.", file=sys.stderr)
-    raise
-
-try:
-    from monai.networks.nets import DynUNet
-    from monai.losses import SSIMLoss
-    from monai.inferers import SlidingWindowInferer
-except Exception as e:
-    print("MONAI is required but not installed.", file=sys.stderr)
-    raise
+import SimpleITK as sitk
+from monai.networks.nets import DynUNet
+from monai.losses import SSIMLoss
+from monai.inferers import SlidingWindowInferer
 
 
 # ----------------------------- Config ---------------------------------
@@ -87,7 +71,7 @@ VAL_FRACTION = 0.05
 RANDOM_SEED = 42
 
 BATCH_SIZE = 8  ###
-EPOCHS = 25  ###15  ###
+EPOCHS = 3 ###25  ###15  ###
 LR = 5e-5  ###1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -102,18 +86,9 @@ CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-### Enable matmul acceleration on Ampere+ GPUs (helps nnFormer/attention)
-# try:
-#     torch.set_float32_matmul_precision("medium")
-# except Exception:
-#     pass
-
 # Use tuned convolution algorithms when input shapes are static
-try:
-    import torch.backends.cudnn as cudnn
-    cudnn.benchmark = True
-except Exception:
-    pass
+import torch.backends.cudnn as cudnn
+cudnn.benchmark = True
 
 
 # ----------------------------- I/O Utils -------------------------------
@@ -149,17 +124,17 @@ def write_nifti(volume: np.ndarray, meta: Dict, out_path: str):
         try:
             img.SetSpacing(meta["spacing"])
         except Exception:
-            pass
+            print("Warning: failed setting spacing in NIfTI metadata")
     if meta and "origin" in meta:
         try:
             img.SetOrigin(meta["origin"])
         except Exception:
-            pass
+            print("Warning: failed setting origin in NIfTI metadata")
     if meta and "direction" in meta:
         try:
             img.SetDirection(meta["direction"])
         except Exception:
-            pass
+            print("Warning: failed setting direction in NIfTI metadata")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     sitk.WriteImage(img, out_path)
 
@@ -233,13 +208,8 @@ def _zarr_write_array(zpath: str, arr: np.ndarray, meta: Dict):
     except TypeError:
         # Signature differences or zarr_format not supported. Try without zarr_format (v2 default).
         try:
-            if _DirectoryStore is not None:
-                store = _DirectoryStore(zpath)
-                z = zarr.create(store=store, shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
-                                compressor=compressor, overwrite=True)
-            else:
-                z = zarr.open(zpath, mode="w", shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
-                              compressor=compressor)
+            z = zarr.open(zpath, mode="w", shape=arr.shape, chunks=(cz, cy, cx), dtype="f4",
+                            compressor=compressor)
         except Exception:
             # Last resort: write uncompressed array (works with v3 defaults)
             z = zarr.open(zpath, mode="w", shape=arr.shape, chunks=(cz, cy, cx), dtype="f4")
@@ -268,7 +238,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
       - `<pid>__drf{drf}.zarr` for each input series found (folders like `1-<drf> dose`)
 
     Notes:
-      - Does not rewrite metadata.csv if it already exists (per user request).
+      - Does not rewrite metadata.csv if it already exists.
       - If ZARR_ROOT contains arrays, conversion is skipped for existing ones.
     """
     os.makedirs(zarr_root, exist_ok=True)
@@ -281,53 +251,47 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
             continue
 
         # 1) Target series (Full_dose)
-        try:
-            tgt_dir = os.path.join(pdir, "Full_dose")
-            zpath = os.path.join(zarr_root, f"{pid}__full.zarr")
+        tgt_dir = os.path.join(pdir, "Full_dose")
+        zpath = os.path.join(zarr_root, f"{pid}__full.zarr")
+        exists_ok = False
+        if os.path.isdir(zpath):
+            # verify openable
+            try:
+                _ = zarr.open(zpath, mode="r")
+                exists_ok = True
+            except Exception:
+                exists_ok = False
+        if not exists_ok and os.path.isdir(tgt_dir):
+            vol, meta = read_dicom_series(tgt_dir)
+            if vol.dtype == np.float64:
+                vol = vol.astype(np.float32, copy=False)
+            _zarr_write_array(zpath, vol, meta)
+
+        # 2) Input series (any folder matching '1-<drf> dose')
+        for sub in sorted(os.listdir(pdir)):
+            drf = _series_match_drf(sub)
+            if drf is None:
+                continue
+            sdir = os.path.join(pdir, sub)
+            zpath = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
             exists_ok = False
             if os.path.isdir(zpath):
-                # verify openable
                 try:
                     _ = zarr.open(zpath, mode="r")
                     exists_ok = True
                 except Exception:
                     exists_ok = False
-            if not exists_ok and os.path.isdir(tgt_dir):
-                vol, meta = read_dicom_series(tgt_dir)
+            if exists_ok:
+                continue
+            try:
+                vol, meta = read_dicom_series(sdir)
                 if vol.dtype == np.float64:
                     vol = vol.astype(np.float32, copy=False)
                 _zarr_write_array(zpath, vol, meta)
-        except Exception as e:
-            print(f"Warning: Zarr convert target failed for {pid}: {e}")
+            except Exception as e:
+                print(f"Warning: Zarr convert input failed {pid} {sub}: {e}")
 
-        # 2) Input series (any folder matching '1-<drf> dose')
-        try:
-            for sub in sorted(os.listdir(pdir)):
-                drf = _series_match_drf(sub)
-                if drf is None:
-                    continue
-                sdir = os.path.join(pdir, sub)
-                zpath = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
-                exists_ok = False
-                if os.path.isdir(zpath):
-                    try:
-                        _ = zarr.open(zpath, mode="r")
-                        exists_ok = True
-                    except Exception:
-                        exists_ok = False
-                if exists_ok:
-                    continue
-                try:
-                    vol, meta = read_dicom_series(sdir)
-                    if vol.dtype == np.float64:
-                        vol = vol.astype(np.float32, copy=False)
-                    _zarr_write_array(zpath, vol, meta)
-                except Exception as e:
-                    print(f"Warning: Zarr convert input failed {pid} {sub}: {e}")
-        except Exception:
-            pass
-
-    # Respect user request: do not rewrite metadata.csv if it already exists.
+    # do not rewrite metadata.csv if it already exists.
     if not os.path.isfile(meta_csv_path):
         # Best-effort minimal metadata if missing: write pid/series/drf/shape only.
         try:
@@ -347,7 +311,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
                             "p001": "", "p999": "",
                         })
                     except Exception:
-                        pass
+                        print(f"Warning: failed reading target zarr for metadata: {pid}")
                 # inputs
                 pdir = os.path.join(data_root, pid)
                 try:
@@ -369,7 +333,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
                                 "p001": "", "p999": "",
                             })
                         except Exception:
-                            pass
+                            print(f"Warning: failed reading input zarr for metadata: {pid} {drf}")
                 except Exception:
                     pass
             if rows:
@@ -526,24 +490,21 @@ def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[st
             in_z = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
             tg_z = os.path.join(zarr_root, f"{pid}__full.zarr")
             if os.path.isdir(in_z) and os.path.isdir(tg_z):
-                try:
-                    zi = zarr.open(in_z, mode="r"); zt = zarr.open(tg_z, mode="r")
-                    pair_shape = (
-                        min(zi.shape[0], zt.shape[0]),
-                        min(zi.shape[1], zt.shape[1]),
-                        min(zi.shape[2], zt.shape[2]),
-                    )
-                    entries.append(ZarrEntry(
-                        pid=pid,
-                        drf=drf,
-                        in_path=in_z,
-                        tg_path=tg_z,
-                        pair_shape=pair_shape,
-                        in_meta={},
-                        tg_meta={},
-                    ))
-                except Exception:
-                    pass
+                zi = zarr.open(in_z, mode="r"); zt = zarr.open(tg_z, mode="r")
+                pair_shape = (
+                    min(zi.shape[0], zt.shape[0]),
+                    min(zi.shape[1], zt.shape[1]),
+                    min(zi.shape[2], zt.shape[2]),
+                )
+                entries.append(ZarrEntry(
+                    pid=pid,
+                    drf=drf,
+                    in_path=in_z,
+                    tg_path=tg_z,
+                    pair_shape=pair_shape,
+                    in_meta={},
+                    tg_meta={},
+                ))
             continue
         in_rec = meta_idx[in_key]
         tg_rec = meta_idx[tg_key]
@@ -553,11 +514,8 @@ def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[st
             # Fallback: probe zarr
             in_z = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
             tg_z = os.path.join(zarr_root, f"{pid}__full.zarr")
-            try:
-                zi = zarr.open(in_z, mode="r"); zt = zarr.open(tg_z, mode="r")
-                in_shape = zi.shape; tg_shape = zt.shape
-            except Exception:
-                continue
+            zi = zarr.open(in_z, mode="r"); zt = zarr.open(tg_z, mode="r")
+            in_shape = zi.shape; tg_shape = zt.shape
         pair_shape = (min(in_shape[0], tg_shape[0]), min(in_shape[1], tg_shape[1]), min(in_shape[2], tg_shape[2]))
         in_z = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
         tg_z = os.path.join(zarr_root, f"{pid}__full.zarr")
@@ -606,13 +564,10 @@ def _persist_percentiles_for_entries(entries: List[ZarrEntry], meta_csv_path: st
         tg_path_per_pid[e.pid] = e.tg_path
         inputs_per_pid.setdefault(e.pid, []).append((e.drf, e.in_path))
     for pid, tg_path in tg_path_per_pid.items():
-        try:
-            arr = zarr.open(tg_path, mode="r")
-            a = np.asarray(arr[:])
-            p1 = float(np.percentile(a, PCT_LOW))
-            p99 = float(np.percentile(a, PCT_HIGH))
-        except Exception:
-            p1, p99 = 0.0, 1.0
+        arr = zarr.open(tg_path, mode="r")
+        a = np.asarray(arr[:])
+        p1 = float(np.percentile(a, PCT_LOW))
+        p99 = float(np.percentile(a, PCT_HIGH))
         per_pid[pid] = (p1, p99)
 
     # 2) Update in-memory entry metadata so dataset normalizes without recomputing
@@ -641,6 +596,7 @@ def _persist_percentiles_for_entries(entries: List[ZarrEntry], meta_csv_path: st
                     key = (row.get("series", ""), row.get("pid", ""), row.get("drf", ""))
                     existing[key] = row
         except Exception:
+            print(f"Warning: failed reading existing metadata.csv: {meta_csv_path}")
             rows = []
             existing = {}
 
@@ -735,12 +691,8 @@ def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Di
     p1 = tg_rec.get("p1") if (tg_rec.get("p1") is not None) else in_rec.get("p1")
     p99 = tg_rec.get("p99") if (tg_rec.get("p99") is not None) else in_rec.get("p99")
     if p1 is None or p99 is None:
-        # Fallback compute on the fly
-        try:
-            p1 = float(np.percentile(tgt_vol, PCT_LOW))
-            p99 = float(np.percentile(tgt_vol, PCT_HIGH))
-        except Exception:
-            p1, p99 = 0.0, 1.0
+        p1 = float(np.percentile(tgt_vol, PCT_LOW))
+        p99 = float(np.percentile(tgt_vol, PCT_HIGH))
     in_vol = minmax_percentile_scale(in_vol, float(p1), float(p99)).astype(np.float32, copy=False)
     tgt_vol = minmax_percentile_scale(tgt_vol, float(p1), float(p99)).astype(np.float32, copy=False)
 
@@ -784,11 +736,8 @@ def load_patient_from_zarr(zarr_root: str, meta_idx: Dict[Tuple[str, str, str], 
     p1 = tg_rec.get("p1") if (tg_rec.get("p1") is not None) else in_rec.get("p1")
     p99 = tg_rec.get("p99") if (tg_rec.get("p99") is not None) else in_rec.get("p99")
     if p1 is None or p99 is None:
-        try:
-            p1 = float(np.percentile(tgt_vol, PCT_LOW))
-            p99 = float(np.percentile(tgt_vol, PCT_HIGH))
-        except Exception:
-            p1, p99 = 0.0, 1.0
+        p1 = float(np.percentile(tgt_vol, PCT_LOW))
+        p99 = float(np.percentile(tgt_vol, PCT_HIGH))
     in_vol = minmax_percentile_scale(in_vol, float(p1), float(p99)).astype(np.float32, copy=False)
     tgt_vol = minmax_percentile_scale(tgt_vol, float(p1), float(p99)).astype(np.float32, copy=False)
 
@@ -979,19 +928,16 @@ class LazyPatchDataset(Dataset):
         yi = self._load_array_with_cache(e.tg_path)
 
         # Compute and cache subject-level robust percentiles once per pair if missing
-        try:
-            if (e.tg_meta.get("p1") is None) or (e.tg_meta.get("p99") is None):
-                src = yi if yi is not None else xi
-                # src may be zarr array; ensure ndarray to compute percentiles
-                if hasattr(src, "__getitem__") and not isinstance(src, np.ndarray):
-                    arr = np.asarray(src[:])
-                else:
-                    arr = np.asarray(src)
-                p1 = float(np.percentile(arr, PCT_LOW))
-                p99 = float(np.percentile(arr, PCT_HIGH))
-                e.tg_meta["p1"], e.tg_meta["p99"] = p1, p99
-        except Exception:
-            pass
+        if (e.tg_meta.get("p1") is None) or (e.tg_meta.get("p99") is None):
+            src = yi if yi is not None else xi
+            # src may be zarr array; ensure ndarray to compute percentiles
+            if hasattr(src, "__getitem__") and not isinstance(src, np.ndarray):
+                arr = np.asarray(src[:])
+            else:
+                arr = np.asarray(src)
+            p1 = float(np.percentile(arr, PCT_LOW))
+            p99 = float(np.percentile(arr, PCT_HIGH))
+            e.tg_meta["p1"], e.tg_meta["p99"] = p1, p99
 
         # Insert into LRU and evict if needed
         self._pair_cache[key] = (xi, yi)
@@ -1007,10 +953,7 @@ class LazyPatchDataset(Dataset):
     def _load_array_with_cache(self, path: str):
         # If path is a Zarr directory, open with zarr
         if path.endswith('.zarr') and os.path.isdir(path):
-            try:
-                return zarr.open(path, mode='r')
-            except Exception:
-                pass
+            return zarr.open(path, mode='r')
         # If path is .npy, open as memmap for zero-copy slices
         if path.endswith('.npy'):
             try:
@@ -1224,6 +1167,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 total = getattr(props, 'total_memory', 0) / (1024 ** 3)
                 print(f"GPU memory: alloc={alloc:.2f}GB reserved={reserved:.2f}GB peak={max_alloc:.2f}GB total={total:.2f}GB")
             except Exception:
+                print("Failed to query GPU memory usage")
                 pass
             printed_gpu_mem = True
         train_loss = ep_loss / max(1, n_batches)
@@ -1257,8 +1201,8 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
         try:
             plot_curves(train_hist, val_hist, CURVE_PNG)
         except Exception:
-            pass
-
+            print("Failed to plot training curves")
+            
         # Save checkpoint every epoch
         try:
             ckpt_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}_{RUN_ID}_epoch{epoch:03d}.pt")
@@ -1276,9 +1220,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 }
             }, ckpt_path)
         except Exception:
-            # best-effort checkpointing; continue training on failure
-            pass
-
+            raise RuntimeError("Failed to save model checkpoint")
     return model, inferer, train_hist, val_hist
 
 
@@ -1316,6 +1258,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
             try:
                 write_nifti(pred_np, p.input_meta, out_path)
             except Exception:
+                print(f"Warning: failed writing NIfTI metadata for pid={p.pid}")
                 # fallback without metadata
                 write_nifti(pred_np, {}, out_path)
 
@@ -1332,7 +1275,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
                 f.write(",".join([r[0]] + [f"{x:.6f}" for x in r[1:]]) + "\n")
         print(f"Wrote metrics summary: {summary_path}")
     except Exception:
-        pass
+        print("Warning: failed writing metrics summary CSV")
 
 
 # ------------------------------ Main -----------------------------------
@@ -1562,7 +1505,7 @@ def main():
         try:
             val_patients.append(load_patient_from_zarr(ZARR_ROOT, meta_idx, e.pid, args.drf))
         except Exception as ex:
-            print(f"Skipping val {e.pid}: {ex}")
+            print(f"Warning: skipping val {e.pid}: {ex}")
 
     # Train
     model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_patients)
