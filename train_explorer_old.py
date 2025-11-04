@@ -4,13 +4,13 @@ Minimal training + validation script for low-dose PET.
 
 Assumptions:
 - Input data is located under:
-  /root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects
+  /root/EXPLORER/PART1
   Each patient folder contains subfolders:
-    - "1-10 dose"  or other DRF (input)
-    - "Full_dose"  (target)
-- Each subfolder contains a DICOM series (Siemens .IMA files). We read the first series found.
+    - "2.886 x 600 WB D4" or other DRF (input)
+    - "2.886 x 600 WB NORMAL"  (target)
+- Each subfolder contains a DICOM series (.dcm files). We read the first series found.
 - Outputs (.nii.gz) are written to:
-  /root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output
+  /root/EXPLORER/PART1/output
 
 This is a minimal prototype script with light error handling.
 """
@@ -24,7 +24,6 @@ import argparse
 import re
 import csv
 from dataclasses import dataclass
-import json
 from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 
@@ -47,17 +46,15 @@ from monai.inferers import SlidingWindowInferer
 
 # ----------------------------- Config ---------------------------------
 
-DATA_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects"
+DATA_ROOT = "/root/EXPLORER/PART1"
 # Zarr arrays live under DATA_ROOT/zarr as `<pid>__drf{drf}.zarr` and `<pid>__full.zarr`
 ZARR_ROOT = os.path.join(DATA_ROOT, "zarr")
-NPY_ROOT = "/dev/null/unused_npz_path"  # legacy (unused after Zarr migration)
-META_CSV = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects/metadata.csv"
-OUTPUT_ROOT = "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output"
+META_CSV = "/root/EXPLORER/PART1/metadata.csv"
+OUTPUT_ROOT = "/root/EXPLORER/PART1/output"
 # Local artifact directories
 BASE_DIR = os.path.dirname(__file__)
-FIG_DIR = os.path.join(BASE_DIR, "figures")
-MODEL_DIR = os.path.join(BASE_DIR, "trained-models")
-GLOBAL_PCT_FILE = os.path.join(BASE_DIR, "global_percentiles.json")
+FIG_DIR = os.path.join(BASE_DIR, "figures_explorer")
+MODEL_DIR = os.path.join(BASE_DIR, "trained-models_explorer")
 
 MODEL_NAME = "nnformer"  ### choices: "DynUNet" or "nnFormer"
 PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128) (80, 80, 80)
@@ -75,7 +72,7 @@ if MODEL_NAME.lower() == "nnformer":
     
 NUM_LAYERS = len(FILTERS)
 BATCH_SIZE = 8 
-EPOCHS = 25  ###
+EPOCHS = 3  ### 25 
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
 
@@ -198,13 +195,13 @@ def _parse_shape(s: str) -> Optional[Tuple[int, int, int]]:
 
 
 def _series_match_drf(name: str) -> Optional[int]:
-    """Return DRF int if folder looks like '1-10 dose', else None."""
-    m = re.match(r"^1-(\d+)\s*dose$", name.strip(), flags=re.IGNORECASE)
+    """Return the integer after 'D' in names like '2.886 x 600 WB D20'. If absent, return None."""
+    m = re.search(r"\bD\s*(\d+)\b", name.strip(), flags=re.IGNORECASE)
     if not m:
         return None
     try:
         return int(m.group(1))
-    except Exception:
+    except ValueError:
         return None
 
 
@@ -277,7 +274,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
             continue
 
         # 1) Target series (Full_dose)
-        tgt_dir = os.path.join(pdir, "Full_dose")
+        tgt_dir = os.path.join(pdir, "2.886 x 600 WB NORMAL")
         zpath = os.path.join(zarr_root, f"{pid}__full.zarr")
         exists_ok = False
         if os.path.isdir(zpath):
@@ -422,79 +419,6 @@ def minmax_percentile_scale(x: np.ndarray, p1: float, p99: float) -> np.ndarray:
     return y  ###np.clip(y, 0.0, 1.0, out=y)
 
 
-def _load_global_percentiles(path: str = GLOBAL_PCT_FILE) -> Optional[Tuple[float, float]]:
-    try:
-        if os.path.isfile(path):
-            with open(path, "r") as f:
-                obj = json.load(f)
-            p1 = float(obj.get("p_low"))
-            p99 = float(obj.get("p_high"))
-            return p1, p99
-    except Exception:
-        pass
-    return None
-
-
-def _save_global_percentiles(p1: float, p99: float, path: str = GLOBAL_PCT_FILE):
-    try:
-        with open(path, "w") as f:
-            json.dump({
-                "pct_low": PCT_LOW,
-                "pct_high": PCT_HIGH,
-                "p_low": float(p1),
-                "p_high": float(p99),
-                "source": "targets",
-            }, f)
-        print(f"Saved global percentiles to {path}: p{PCT_LOW}={p1:.6g}, p{PCT_HIGH}={p99:.6g}")
-    except Exception as e:
-        print(f"Warning: failed to save global percentiles: {e}")
-
-
-def compute_or_load_global_percentiles_from_training_targets(
-    entries: List["ZarrEntry"], 
-    cache_path: str = GLOBAL_PCT_FILE,
-    force_recompute: bool = False
-) -> Tuple[float, float]:
-    """Return global p0.1/p99.9 computed over training targets; cache to JSON.
-
-    If cache exists, load and return it. Otherwise compute from the training
-    target Zarr arrays and persist. Minimal error handling as requested.
-    """
-    cached = _load_global_percentiles(cache_path)
-    if cached is not None and not force_recompute:
-        return cached
-
-    # Gather values from training targets. To avoid excessive memory, subsample
-    # uniformly if needed (simple stride-based sampling). This keeps code simple
-    # while still reflecting the global distribution reasonably well.
-    samples: List[np.ndarray] = []
-    n_entries = max(1, len(entries))
-    step = 100  ### for downsampling
-
-    for e in tqdm(entries, desc="GlobalPercentiles", unit="entry", dynamic_ncols=True):
-        try:
-            zt = zarr.open(e.tg_path, mode="r")
-            a = np.asarray(zt[:], dtype=np.float32)
-            flat = a.ravel()
-            rand_offset = random.randint(0, step - 1)
-            flat = flat[rand_offset::step]
-            samples.append(flat)
-        except Exception as ex:
-            print(f"Warning: failed reading target for global percentiles {e.pid}: {ex}")
-
-    if not samples:
-        # Fallback to a safe default range if no data could be read
-        p1, p99 = 0.0, 1.0
-        _save_global_percentiles(p1, p99, cache_path)
-        return p1, p99
-
-    merged = np.concatenate(samples, axis=0)
-    p1 = float(np.percentile(merged, PCT_LOW))
-    p99 = float(np.percentile(merged, PCT_HIGH))
-    _save_global_percentiles(p1, p99, cache_path)
-    return p1, p99
-
-
 def find_patients(data_root: str) -> List[str]:
     pids = []
     for name in sorted(os.listdir(data_root)):
@@ -539,44 +463,6 @@ def load_metadata_index(meta_csv_path: str = META_CSV) -> Dict[Tuple[str, str, s
     except Exception as e:
         print(f"Warning: failed to read metadata.csv: {e}")
     return idx
-
-
-def build_npy_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[str], drf: int, npy_root: str = NPY_ROOT) -> List[NpyEntry]:
-    entries: List[NpyEntry] = []
-    for pid in pids:
-        in_key = ("input", pid, str(drf))
-        tg_key = ("target", pid, "full")
-        if in_key not in meta_idx or tg_key not in meta_idx:
-            continue
-        in_rec = meta_idx[in_key]
-        tg_rec = meta_idx[tg_key]
-        in_shape = _parse_shape(in_rec.get("shape", ""))
-        tg_shape = _parse_shape(tg_rec.get("shape", ""))
-        if not in_shape or not tg_shape:
-            continue
-        pair_shape = (min(in_shape[0], tg_shape[0]), min(in_shape[1], tg_shape[1]), min(in_shape[2], tg_shape[2]))
-        entries.append(NpyEntry(
-            pid=pid,
-            drf=drf,
-            in_path=os.path.join(npy_root, in_rec["file"]),
-            tg_path=os.path.join(npy_root, tg_rec["file"]),
-            pair_shape=pair_shape,
-            in_meta={
-                "spacing": in_rec.get("spacing"),
-                "origin": in_rec.get("origin"),
-                "direction": in_rec.get("direction"),
-                "p1": in_rec.get("p1"),
-                "p99": in_rec.get("p99"),
-            },
-            tg_meta={
-                "spacing": tg_rec.get("spacing"),
-                "origin": tg_rec.get("origin"),
-                "direction": tg_rec.get("direction"),
-                "p1": tg_rec.get("p1"),
-                "p99": tg_rec.get("p99"),
-            },
-        ))
-    return entries
 
 
 def build_zarr_entries(meta_idx: Dict[Tuple[str, str, str], Dict], pids: List[str], drf: int, zarr_root: str = ZARR_ROOT) -> List[ZarrEntry]:
@@ -808,12 +694,8 @@ def load_patient_from_npy(npy_root: str, meta_idx: Dict[Tuple[str, str, str], Di
     return PatientItem(pid=pid, input_arr=in_vol, target_arr=tgt_vol, input_meta=in_meta, target_meta=tg_meta)
 
 
-def load_patient_from_zarr(zarr_root: str, meta_idx: Dict[Tuple[str, str, str], Dict], pid: str, drf: int, *, global_p1: Optional[float] = None, global_p99: Optional[float] = None) -> PatientItem:
-    """Load a patient input/target pair from Zarr, crop-align, and min-max scale.
-
-    If global_p1/global_p99 are provided, use them for normalization; otherwise fall
-    back to subject-level robust percentiles (from metadata when available).
-    """
+def load_patient_from_zarr(zarr_root: str, meta_idx: Dict[Tuple[str, str, str], Dict], pid: str, drf: int) -> PatientItem:
+    """Load a patient input/target pair from Zarr, crop-align, and min-max scale via subject-level robust percentiles."""
     in_path = os.path.join(zarr_root, f"{pid}__drf{drf}.zarr")
     tg_path = os.path.join(zarr_root, f"{pid}__full.zarr")
     if not (os.path.isdir(in_path) and os.path.isdir(tg_path)):
@@ -836,15 +718,11 @@ def load_patient_from_zarr(zarr_root: str, meta_idx: Dict[Tuple[str, str, str], 
     tg_key = ("target", pid, "full")
     in_rec = meta_idx.get(in_key, {})
     tg_rec = meta_idx.get(tg_key, {})
-    if (global_p1 is not None) and (global_p99 is not None):
-        p1 = float(global_p1)
-        p99 = float(global_p99)
-    else:
-        p1 = tg_rec.get("p1") if (tg_rec.get("p1") is not None) else in_rec.get("p1")
-        p99 = tg_rec.get("p99") if (tg_rec.get("p99") is not None) else in_rec.get("p99")
-        if p1 is None or p99 is None:
-            p1 = float(np.percentile(tgt_vol, PCT_LOW))
-            p99 = float(np.percentile(tgt_vol, PCT_HIGH))
+    p1 = tg_rec.get("p1") if (tg_rec.get("p1") is not None) else in_rec.get("p1")
+    p99 = tg_rec.get("p99") if (tg_rec.get("p99") is not None) else in_rec.get("p99")
+    if p1 is None or p99 is None:
+        p1 = float(np.percentile(tgt_vol, PCT_LOW))
+        p99 = float(np.percentile(tgt_vol, PCT_HIGH))
     in_vol = minmax_percentile_scale(in_vol, float(p1), float(p99)).astype(np.float32, copy=False)
     tgt_vol = minmax_percentile_scale(tgt_vol, float(p1), float(p99)).astype(np.float32, copy=False)
 
@@ -964,13 +842,11 @@ class LazyPatchDataset(Dataset):
     Normalizes using subject-level robust percentiles p1/p99 from metadata when available.
     """
 
-    def __init__(self, entries: List[NpyEntry], patch_size: Tuple[int, int, int], stride: Tuple[int, int, int], augment: bool = True, global_p1: Optional[float] = None, global_p99: Optional[float] = None):
+    def __init__(self, entries: List[NpyEntry], patch_size: Tuple[int, int, int], stride: Tuple[int, int, int], augment: bool = True):
         self.entries = entries
         self.patch_size = patch_size
         self.stride = stride
         self.augment = augment
-        self.global_p1 = float(global_p1) if (global_p1 is not None) else None
-        self.global_p99 = float(global_p99) if (global_p99 is not None) else None
 
         # Precompute patch coordinates for all entries using pair_shape
         self.index: List[Tuple[int, Tuple[int, int, int]]] = []  # (entry_idx, (z,y,x))
@@ -1002,15 +878,11 @@ class LazyPatchDataset(Dataset):
         xin = np.asarray(xi[z:z+pd, y:y+ph, x:x+pw])
         ygt = np.asarray(yi[z:z+pd, y:y+ph, x:x+pw])
 
-        # Global robust min–max if provided; otherwise subject-level from metadata
-        if (self.global_p1 is not None) and (self.global_p99 is not None):
-            p1 = self.global_p1
-            p99 = self.global_p99
-        else:
-            p1 = e.tg_meta.get("p1") if (e.tg_meta.get("p1") is not None) else e.in_meta.get("p1")
-            p99 = e.tg_meta.get("p99") if (e.tg_meta.get("p99") is not None) else e.in_meta.get("p99")
-            p1 = float(p1 if p1 is not None else 0.0)
-            p99 = float(p99 if p99 is not None else 1.0)
+        # Subject-level robust min-max using shared p1/p99 (prefer target metadata)
+        p1 = e.tg_meta.get("p1") if (e.tg_meta.get("p1") is not None) else e.in_meta.get("p1")
+        p99 = e.tg_meta.get("p99") if (e.tg_meta.get("p99") is not None) else e.in_meta.get("p99")
+        p1 = float(p1 if p1 is not None else 0.0)
+        p99 = float(p99 if p99 is not None else 1.0)
         xin = minmax_percentile_scale(xin, p1, p99)
         ygt = minmax_percentile_scale(ygt, p1, p99)
 
@@ -1020,7 +892,7 @@ class LazyPatchDataset(Dataset):
         if self.augment:
             xt, yt = random_augment(xt, yt)
 
-        # Return p1/p99 used (global or subject-level) for observability/debug.
+        # Return subject-level p1/p99 to support empty-patch skipping in the training loop.
         stats = torch.tensor([p1, p99], dtype=torch.float32)
 
         return xt, yt, stats
@@ -1615,20 +1487,14 @@ def main():
     else:
         train_entries = build_zarr_entries(meta_idx, train_pids, args.drf, ZARR_ROOT)
 
-    # Global percentiles for normalization (computed from training targets, cached to JSON)
-    if args.validate:
-        gp = _load_global_percentiles(GLOBAL_PCT_FILE)
-        if gp is None:
-            print(f"Warning: global percentile file not found: {GLOBAL_PCT_FILE}. Using defaults (0,1).")
-            global_p1, global_p99 = 0.0, 1.0
-        else:
-            global_p1, global_p99 = gp
-    else:
-        global_p1, global_p99 = compute_or_load_global_percentiles_from_training_targets(
-            train_entries, GLOBAL_PCT_FILE, force_recompute = False)  ###
+    # Compute and persist robust percentiles (0.1/99.9) for subjects so next runs use them
+    try:
+        _persist_percentiles_for_entries(train_entries + val_entries, META_CSV)
+    except Exception as ex:
+        print(f"Warning: failed to persist percentiles: {ex}")
 
     if not args.validate:
-        train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True, global_p1=global_p1, global_p99=global_p99)
+        train_ds = LazyPatchDataset(train_entries, PATCH_SIZE, PATCH_STRIDE, augment=True)
         print(f"Train patches: {len(train_ds)} across {len(train_entries)} patients")
 
     # Build full volumes for validation (smaller set) just-in-time
@@ -1637,7 +1503,7 @@ def main():
     val_patients: List[PatientItem] = []
     for e in val_entries:
         try:
-            val_patients.append(load_patient_from_zarr(ZARR_ROOT, meta_idx, e.pid, args.drf, global_p1=global_p1, global_p99=global_p99))
+            val_patients.append(load_patient_from_zarr(ZARR_ROOT, meta_idx, e.pid, args.drf))
         except Exception as ex:
             print(f"Warning: skipping val {e.pid}: {ex}")
 

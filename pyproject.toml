@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "low-dose-pet-235"
 version = "0.1.0"
-description = "Minimal MONAI DynUNet training + inference for low-dose PET"
-readme = "low_dose_pet_235/README.md"
+description = "Minimal training + inference for low-dose PET"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.23",
@@ -16,10 +16,13 @@ dependencies = [
   "torch>=2.1.0",
   "tqdm>=4.64",
   "batchgenerators>=0.25",
-  "timm>=0.6.12",  # add zarr
-  "zarr>=2.4.0",  # i think version is ok
+  "timm>=0.6.12",
+  "zarr>=2.4.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["low_dose_pet_235*"]
+exclude = ["figures*", "nnFormer*"]
 
 [tool.setuptools]
 include-package-data = false
-
