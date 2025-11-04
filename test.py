@@ -109,7 +109,7 @@ def write_nifti_with_units(volume: np.ndarray, meta: Dict, out_path: str, units:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Apply trained DynUNet to test NIfTI volumes")
+    ap = argparse.ArgumentParser(description="Apply trained model to test NIfTI volumes")
     ap.add_argument("--drf", type=int, required=True, help="Dose reduction factor to select (e.g., 4, 10, 20, 50, 100)")
     ap.add_argument("--model", type=str, default="", help="Path to trained model .pt; if omitted, uses train.py's pretrained model mapping for the DRF or falls back to the newest trained-models/ match")
     ap.add_argument("--input-dir", type=str, default=DEFAULT_INPUT_DIR)
@@ -201,15 +201,13 @@ def main():
     for (fname, row) in files:
         in_path = os.path.join(args.input_dir, fname)
         vol, meta = read_nifti(in_path)  # [D,H,W]
-
         # Robust percentiles per subject consistent with train.py
         p1 = float(np.percentile(vol, PCT_LOW))
         p99 = float(np.percentile(vol, PCT_HIGH))
         scale = float(max(1e-6, p99 - p1))
-
+    
         # Min–max normalize to [0,1]
         vol_mm = minmax_percentile_scale(vol, p1, p99)
-        print(vol_mm.sum())
 
         # Sliding-window prediction using MONAI inferer
         with torch.no_grad():
@@ -217,12 +215,30 @@ def main():
             pred_mm = inferer(xt, model)
             pred_mm = pred_mm.clamp(0.0, None)
             pred_mm = pred_mm[0, 0].float().cpu().numpy()
-        print(pred_mm.sum())
         # De-normalize back to the input intensity domain
         pred = pred_mm * scale + p1
         # print(f"Total dose input: {vol.sum():.2f} Bq") # *meta.get('spacing', (1,1,1))[0]*meta.get('spacing', (1,1,1))[1]*meta.get('spacing', (1,1,1))[2]
-        # print(f"Total dose output: {pred.sum():.2f} Bq")
-
+        print(f"Output dose sum: {pred.sum():.2f} Bq")
+        
+        ###
+        import matplotlib.pyplot as plt
+        NBINS = 200
+        counts, edges = np.histogram(vol[(vol > p1) & (vol < p99)], bins=NBINS)
+        counts_out, edges_out = np.histogram(pred[(pred > p1) & (pred < p99)], bins=NBINS)
+        centers_out = 0.5*(edges_out[1:] + edges_out[:-1])
+        centers = 0.5*(edges[1:] + edges[:-1])
+        plt.figure()
+        plt.step(centers, counts, where="mid", label="Input", color="blue", alpha=0.7)
+        plt.step(centers_out, counts_out, where="mid", label="Output", color="red", alpha=0.7)
+        plt.legend()
+        plt.title(f"Histogram of volume {fname} (DRF={args.drf})")
+        plt.xlabel("Intensity (Bq/mL)")
+        plt.ylabel("Voxel counts")
+        plt.grid(True)
+        plt.savefig(os.path.join("/root/low_dose_pet_235/figures", f"{os.path.splitext(fname)[0]}_hist_input.png"))
+        ###
+        print(f"Input sum: {vol.sum():.2f} Bq")
+        
         # Determine units from CSV; preserve BQML if already present
         units_val = (row.get("ImageUnits") or row.get("Units") or "").strip().upper()
         units_norm = "BQML" if ("BQML" in units_val or "BQ/ML" in units_val.replace(" ", "")) else units_val
@@ -233,6 +249,7 @@ def main():
             # write geometry + annotate units
             write_nifti_with_units(pred, meta, out_path, units=units_norm)
         except Exception:
+            print("Warning: failed to preserve geometry metadata; writing without it.")
             write_nifti_with_units(pred, {}, out_path, units=units_norm)
         print(f"Saved: {out_path} (units: {units_norm or 'unknown'})")
 
@@ -249,11 +266,8 @@ def main():
             vis_patients.append(pitem)
 
     # Save visualizations for up to 3 samples
-    try:
-        os.makedirs(FIG_DIR, exist_ok=True)
-        plot_val_examples(model, inferer, vis_patients, n=3)
-    except Exception:
-        print("Warning: failed to save visualization grids.")
+    os.makedirs(FIG_DIR, exist_ok=True)
+    plot_val_examples(model, inferer, vis_patients, n=3)
 
 
 if __name__ == "__main__":

@@ -57,24 +57,28 @@ BASE_DIR = os.path.dirname(__file__)
 FIG_DIR = os.path.join(BASE_DIR, "figures")
 MODEL_DIR = os.path.join(BASE_DIR, "trained-models")
 
-MODEL_NAME = "dynunet"  ### choices: "DynUNet" or "nnFormer"
-PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128)  (96, 96, 96)  ###(80, 80, 80)
+MODEL_NAME = "nnformer"  ### choices: "DynUNet" or "nnFormer"
+PATCH_SIZE =   (96, 96, 96) # (64, 64, 64) (128, 128, 128) (80, 80, 80)
 # Slight overlap: stride < patch size; 80 gives 16 voxels overlap
-PATCH_STRIDE =   (80, 80, 80)  #(48, 48, 48) (96, 96, 96)  (80, 80, 80)  ###(64, 64, 64)
+PATCH_STRIDE =   (80, 80, 80)  #(48, 48, 48) (96, 96, 96) (64, 64, 64)
 
-MAX_PATIENTS = None  ### set to an int to limit for quick tests
+MAX_PATIENTS = 3  # None  ### set to an int to limit for quick tests
 VAL_FRACTION = 0.05  
 RANDOM_SEED = 42
 
-FILTERS = [16, 32, 64, 128, 256, 512]
+if MODEL_NAME.lower() == "dynunet":
+    FILTERS = [16, 32, 64, 128, 256, 512]
+if MODEL_NAME.lower() == "nnformer":
+    FILTERS = [8, 16, 32, 64]
+    
 NUM_LAYERS = len(FILTERS)
-BATCH_SIZE = 8  ###
-EPOCHS = 25  ###15  ###
-LR = 5e-5  ###1e-4
+BATCH_SIZE = 8 
+EPOCHS = 3  ### 25 
+LR = 1e-4
 WEIGHT_DECAY = 1e-5
 
-LOSS_MSE_W = 0.9
-LOSS_SSIM_W = 0.1
+LOSS_MSE_W = 0.95
+LOSS_SSIM_W = 0.05
 
 # Robust scaling percentiles used for [0,1] normalization
 PCT_LOW = 0.1
@@ -83,22 +87,26 @@ PCT_HIGH = 99.9
 PRETRAINED_MODEL_100DRF = os.path.join(MODEL_DIR, "dynunet_20251102_1852_drf100_epoch023.pt")
 FILTERS_100DRF = [32, 64, 128, 256, 512]
 NUM_LAYERS_100DRF = len(FILTERS_100DRF)
-PRETRAINED_MODEL_50DRF = os.path.join(MODEL_DIR, "dynunet_20251102_2132_drf50_epoch023.pt")
-FILTERS_50DRF = [16, 32, 64, 128, 256, 512]
+
+PRETRAINED_MODEL_50DRF = os.path.join(MODEL_DIR, "nnformer_20251103_1811_drf50.pt")
+FILTERS_50DRF = [8, 16, 32, 64]
 NUM_LAYERS_50DRF = len(FILTERS_50DRF)
+
 PRETRAINED_MODEL_20DRF = os.path.join(MODEL_DIR, "dynunet_20251102_1145_drf20_epoch014.pt")
 FILTERS_20DRF = [16, 32, 64, 128, 256]
 NUM_LAYERS_20DRF = len(FILTERS_20DRF)
+
 PRETRAINED_MODEL_10DRF = os.path.join(MODEL_DIR, "dynunet_20251102_0009_drf10_epoch014.pt")
 FILTERS_10DRF = None
 NUM_LAYERS_10DRF = 5
+
 PRETRAINED_MODEL_4DRF = os.path.join(MODEL_DIR, "dynunet_20251102_0009_drf4_epoch014.pt")
 FILTERS_4DRF = None
 NUM_LAYERS_4DRF = 5
 
 RUN_ID = time.strftime("%Y%m%d_%H%M")  # updated later to include DRF
 RUN_ID_BASE = RUN_ID
-CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
+CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{MODEL_NAME}_{RUN_ID}.png")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
@@ -261,7 +269,7 @@ def convert_all_to_zarr_if_needed(data_root: str = DATA_ROOT, zarr_root: str = Z
 
     pids = [d for d in sorted(os.listdir(data_root)) if os.path.isdir(os.path.join(data_root, d))]
     print(f"Ensuring Zarr cache for {len(pids)} patients at {zarr_root} ...")
-    for pid in tqdm(pids, desc="Zarr", unit="pid"):
+    for pid in tqdm(pids, desc="Zarr", unit="pid", dynamic_ncols=True):
         pdir = os.path.join(data_root, pid)
         if not os.path.isdir(pdir):
             continue
@@ -1021,7 +1029,6 @@ def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96
         kernel_size = [[3, 3, 3]] * num_layers
         strides = [1] + [2] * (num_layers - 1)
         up_kernels = [2] * num_layers  # 6 layers now, before it was 5
-        # add to make the model larger: filters=[8, 16, 32, 64, 128, 256], 512]
         if filters is not None:
             model = DynUNet(
                 spatial_dims=3,
@@ -1030,7 +1037,7 @@ def make_model(model_name: str = "DynUNet", img_size: Tuple[int, int, int] = (96
                 kernel_size=kernel_size,
                 strides=strides,
                 upsample_kernel_size=up_kernels,
-                filters=filters, ###
+                filters=filters,
                 norm_name=("instance", {"affine": True}),
                 act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
                 deep_supervision=False,
@@ -1085,11 +1092,11 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     model = make_model(model_name=MODEL_NAME, img_size=PATCH_SIZE, num_layers=NUM_LAYERS, filters=FILTERS).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    mse = nn.L1Loss() ###nn.MSELoss()
+    mse = nn.L1Loss()  ### nn.MSELoss()
     ssim = SSIMLoss(spatial_dims=3, data_range=1.0)  # min-max scaled to [0,1]
 
     # MONAI sliding window inferer for validation/inference
-    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.2, mode="gaussian")
+    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.5, mode="gaussian")
 
     # Keep worker count modest to avoid CPU thrash from IO/decompression
     # DataLoader tuning: more workers, pinned memory for faster H2D, and prefetching
@@ -1122,10 +1129,6 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
     # Ensure model directory exists for per-epoch checkpoints
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    ### # Mixed precision can significantly speed up training on GPUs
-    # use_amp = DEVICE.type == "cuda"
-    # scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
     for epoch in range(1, EPOCHS + 1):
         model.train()
         ep_loss = 0.0
@@ -1133,7 +1136,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
         skipped_empty = 0
         total_seen = 0
         t0 = time.time()
-        for batch in tqdm(loader, desc="Training", unit="batch", leave=False):
+        for batch in tqdm(loader, desc="Training", unit="batch", leave=False, dynamic_ncols=True):
             # Support datasets returning (x,y) or (x,y,stats)
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
                 xb, yb, gstats = batch
@@ -1143,6 +1146,9 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
 
             xb = xb.to(DEVICE, non_blocking=True)  # [B,C,D,H,W]
             yb = yb.to(DEVICE, non_blocking=True)
+
+            print(f"p99 for xb: {torch.max(xb).item()}, p99 for yb: {torch.max(yb).item()}")
+            print(f"p1 for xb: {torch.min(xb).item()}, p1 for yb: {torch.min(yb).item()}")
 
             # Skip empty patches, but keep some to ensure it works on inference
             with torch.no_grad():
@@ -1168,20 +1174,12 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
             assert torch.isfinite(xb).all() and torch.isfinite(yb).all()
             
             opt.zero_grad(set_to_none=True)
-            ### with torch.cuda.amp.autocast(enabled=use_amp):
             pred = model(xb)
-            # Constrain predictions to [0,1] for stable loss with [0,1]-scaled targets
-            ### pred = torch.sigmoid(pred)
             l = LOSS_MSE_W * mse(pred, yb) + LOSS_SSIM_W * ssim(pred, yb)
             
             if not torch.isfinite(l):
                 raise ValueError(f"Non-finite loss {l.item()}, skipping batch")
                 
-            ### scaler.scale(l).backward()
-            # scaler.step(opt)
-            # scaler.update()
-            
-            ### changed scaler to
             l.backward()
             opt.step()
             
@@ -1217,7 +1215,7 @@ def train_and_validate(train_ds: PatchDataset, val_patients: List[PatientItem]):
                 # rotate through patients across epochs
                 start = ((epoch - 1) * N_VAL) % len(val_patients)
                 sel = [val_patients[(start + i) % len(val_patients)] for i in range(N_VAL)]
-                for vp in tqdm(sel, desc="Validation", unit="case", leave=False):
+                for vp in tqdm(sel, desc="Validation", unit="case", leave=False, dynamic_ncols=True):
                     xt = torch.from_numpy(vp.input_arr).float()[None, None].to(DEVICE, non_blocking=True)
                     yt = torch.from_numpy(vp.target_arr).float()[None, None].to(DEVICE, non_blocking=True)
                     pred_full = inferer(xt, model)
@@ -1294,7 +1292,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
             b_mse, b_ssim = mse_ssim_metrics(xt, yt, ssim_eval)
 
             # Save NIfTI
-            out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}_{RUN_ID}.nii.gz")
+            out_path = os.path.join(OUTPUT_ROOT, f"{p.pid}_{MODEL_NAME}_{RUN_ID}.nii.gz")
             if save_nifti:
                 pred_np = pred[0, 0].float().clamp(0.0, None).cpu().numpy()
                 try:
@@ -1309,7 +1307,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
 
     # Write a small summary CSV alongside outputs
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
-    summary_path = os.path.join(OUTPUT_ROOT, f"metrics_summary_{RUN_ID}.csv")
+    summary_path = os.path.join(OUTPUT_ROOT, f"metrics_summary_{MODEL_NAME}_{RUN_ID}.csv")
     try:
         with open(summary_path, "w") as f:
             f.write("patient,model_mse,model_ssim,baseline_mse,baseline_ssim\n")
@@ -1323,7 +1321,7 @@ def save_all_outputs(model: nn.Module, inferer: SlidingWindowInferer, patients: 
 # ------------------------------ Main -----------------------------------
 
 def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patients: List[PatientItem], n: int = 3):
-    """Plot up to n coronal-slice examples from validation set.
+    """Plot up to n slice examples from validation set.
     Layout: top row = input/target/output (inferno); bottom row = error maps
     for target-input and target-output (bwr). Saves PNGs in FIG_DIR.
     """
@@ -1392,12 +1390,12 @@ def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patie
             ax_empty.set_visible(False)
             fig.suptitle(p.pid)
             plt.tight_layout(rect=[0, 0, 1, 0.96])
-            out_png = os.path.join(FIG_DIR, f"{RUN_ID}_{p.pid}_coronal.png")
+            out_png = os.path.join(FIG_DIR, f"{MODEL_NAME}_{RUN_ID}_{p.pid}_sagittal.png")
             plt.savefig(out_png)
             plt.close(fig)
             print(f"Saved validation example plot: {out_png}")
 
-            # Sagittal slice: fix Y (H axis) at middle
+            # Coronal slice: fix Y (H axis) at middle (i initially mislabeled as sagittal)
             ymid = xnp.shape[1] // 2
             x_sag = xnp[:, ymid, :]
             y_sag = ynp[:, ymid, :]
@@ -1423,11 +1421,11 @@ def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patie
             ax_empty_s = fig_s.add_subplot(gs_s[1, 2])
 
             im_in_s = ax_in_s.imshow(x_sag.T, cmap='inferno', vmin=vmin_s, vmax=vmax_s, origin='lower')
-            ax_in_s.set_title('Input (Sagittal)')
+            ax_in_s.set_title('Input (Coronal)')
             im_tg_s = ax_tg_s.imshow(y_sag.T, cmap='inferno', vmin=vmin_s, vmax=vmax_s, origin='lower')
-            ax_tg_s.set_title('Target (Sagittal)')
+            ax_tg_s.set_title('Target (Coronal)')
             im_out_s = ax_out_s.imshow(p_sag.T, cmap='inferno', vmin=vmin_s, vmax=vmax_s, origin='lower')
-            ax_out_s.set_title('Output (Sagittal)')
+            ax_out_s.set_title('Output (Coronal)')
             im_ein_s = ax_ein_s.imshow(e_in_s.T, cmap='bwr', vmin=-eabs_s, vmax=eabs_s, origin='lower')
             ax_ein_s.set_title('Err T-Input')
             im_eout_s = ax_eout_s.imshow(e_out_s.T, cmap='bwr', vmin=-eabs_s, vmax=eabs_s, origin='lower')
@@ -1442,7 +1440,7 @@ def plot_val_examples(model: nn.Module, inferer: SlidingWindowInferer, val_patie
             ax_empty_s.set_visible(False)
             fig_s.suptitle(p.pid)
             plt.tight_layout(rect=[0, 0, 1, 0.96])
-            out_png_s = os.path.join(FIG_DIR, f"{RUN_ID}_{p.pid}_sagittal.png")
+            out_png_s = os.path.join(FIG_DIR, f"{MODEL_NAME}_{RUN_ID}_{p.pid}_coronal.png")
             plt.savefig(out_png_s)
             plt.close(fig_s)
             print(f"Saved validation example plot: {out_png_s}")
@@ -1497,7 +1495,7 @@ def main():
     # Update run identifier to include DRF, and derived artifact paths
     global RUN_ID, CURVE_PNG
     RUN_ID = f"{RUN_ID_BASE}_drf{args.drf}"
-    CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{RUN_ID}.png")
+    CURVE_PNG = os.path.join(FIG_DIR, f"training_curves_{MODEL_NAME}_{RUN_ID}.png")
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
     # Ensure Zarr cache exists; convert if first run
@@ -1584,7 +1582,7 @@ def main():
             model.load_state_dict(state)
         model.eval()
         # MONAI sliding window inferer for validation
-        inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.75, mode="gaussian")  ###
+        inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.2, mode="gaussian")  # for inference in test.py, increase overlap to 0.75
     else:
         # Train
         model, inferer, train_hist, val_hist = train_and_validate(train_ds, val_patients)
@@ -1612,11 +1610,11 @@ def main():
         except Exception as e:
             print(f"Failed to save model: {e}")
 
+    # Plot up to three validation examples
+    plot_val_examples(model, inferer, val_patients, n=3)
+    
     # Save outputs for val
     save_all_outputs(model, inferer, val_patients, save_nifti=False)
-
-    # Plot up to three validation examples (coronal slice grids)
-    plot_val_examples(model, inferer, val_patients, n=3)
 
     print("Done.")
 
