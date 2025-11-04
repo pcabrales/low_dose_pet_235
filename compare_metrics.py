@@ -67,6 +67,7 @@ if __name__ == "__main__":
     files = [
         "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/metrics_summary_20251103_1041_drf50.csv",
         "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/metrics_summary_dynunet_20251104_0830_drf50.csv",
+        "/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/metrics_summary_20251102_0009_drf4.csv"
     ]
     cols = ["model_ssim", "model_mse"]
     print_stats_for_files(files, cols)

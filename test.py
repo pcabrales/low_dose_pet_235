@@ -21,6 +21,7 @@ import argparse
 from typing import Dict, List, Tuple
 
 import numpy as np
+import json
 import torch
 
 import SimpleITK as sitk
@@ -55,6 +56,7 @@ from train import (
     PCT_LOW,
     PCT_HIGH,
     MODEL_NAME,
+    GLOBAL_PCT_FILE,
 )
 
 
@@ -194,17 +196,29 @@ def main():
         return
 
     # MONAI sliding window inferer matching train.py validation overlap
-    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.75, mode="gaussian")  ###0.75
+    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.2, mode="gaussian")  ###0.75
+
+    # Load global normalization percentiles computed at training time
+    try:
+        with open(GLOBAL_PCT_FILE, "r") as f:
+            g = json.load(f)
+        p1_global = float(g["p_low"])
+        p99_global = float(g["p_high"])
+    except Exception:
+        raise RuntimeError(f"Global percentile file not found or invalid: {GLOBAL_PCT_FILE}")
 
     # Predict each file
     vis_patients: List[PatientItem] = []
     for (fname, row) in files:
         in_path = os.path.join(args.input_dir, fname)
         vol, meta = read_nifti(in_path)  # [D,H,W]
-        # Robust percentiles per subject consistent with train.py
-        p1 = float(np.percentile(vol, PCT_LOW))
-        p99 = float(np.percentile(vol, PCT_HIGH))
+        # Use global robust percentiles consistent with training normalization
+        p1 = p1_global
+        p99 = p99_global
         scale = float(max(1e-6, p99 - p1))
+        
+        print(f"Global p999: {p99_global}, p1: {p1_global}")
+        print(f"Patient p99: {np.percentile(vol, 99.9)}, p1: {np.percentile(vol, 0.1)}")
     
         # Min–max normalize to [0,1]
         vol_mm = minmax_percentile_scale(vol, p1, p99)
