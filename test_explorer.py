@@ -28,7 +28,7 @@ import SimpleITK as sitk
 from monai.inferers import SlidingWindowInferer
 
 # Import helpers, constants, and plotting from training script
-from train import (
+from train_explorer import (
     make_model,
     plot_val_examples,
     PatientItem,
@@ -124,6 +124,7 @@ def main():
     model_path = args.model
     num_layers = None
     filters = None
+    
     if not model_path:
         # Prefer explicit pretrained mapping from train.py
         if args.drf == 100:
@@ -216,8 +217,8 @@ def main():
         p99 = p99_global
         scale = float(max(1e-6, p99 - p1))
         
-        print(f"Global p999: {p99_global}, p1: {p1_global}")
-        print(f"Patient p99: {np.percentile(vol, 99.9)}, p1: {np.percentile(vol, 0.1)}")
+        # print(f"Global p999: {p99_global}, p1: {p1_global}")
+        # print(f"Patient p99: {np.percentile(vol, 99.9)}, p1: {np.percentile(vol, 0.1)}")
     
         # Min–max normalize to [0,1]
         vol_mm = minmax_percentile_scale(vol, p1, p99)
@@ -231,26 +232,25 @@ def main():
         # De-normalize back to the input intensity domain
         pred = pred_mm * scale + p1
         # print(f"Total dose input: {vol.sum():.2f} Bq") # *meta.get('spacing', (1,1,1))[0]*meta.get('spacing', (1,1,1))[1]*meta.get('spacing', (1,1,1))[2]
-        print(f"Output dose sum: {pred.sum():.2f} Bq")
-        
-        ###
-        import matplotlib.pyplot as plt
-        NBINS = 200
-        counts, edges = np.histogram(vol[(vol > p1) & (vol < p99)], bins=NBINS)
-        counts_out, edges_out = np.histogram(pred[(pred > p1) & (pred < p99)], bins=NBINS)
-        centers_out = 0.5*(edges_out[1:] + edges_out[:-1])
-        centers = 0.5*(edges[1:] + edges[:-1])
-        plt.figure()
-        plt.step(centers, counts, where="mid", label="Input", color="blue", alpha=0.7)
-        plt.step(centers_out, counts_out, where="mid", label="Output", color="red", alpha=0.7)
-        plt.legend()
-        plt.title(f"Histogram of volume {fname} (DRF={args.drf})")
-        plt.xlabel("Intensity (Bq/mL)")
-        plt.ylabel("Voxel counts")
-        plt.grid(True)
-        plt.savefig(os.path.join("/root/low_dose_pet_235/figures_explorer", f"{os.path.splitext(fname)[0]}_hist_input.png"))
-        ###
-        print(f"Input sum: {vol.sum():.2f} Bq")
+        # print(f"Output dose sum: {pred.sum():.2f} Bq")
+
+        # import matplotlib.pyplot as plt
+        # NBINS = 200
+        # counts, edges = np.histogram(vol[(vol > p1) & (vol < p99)], bins=NBINS)
+        # counts_out, edges_out = np.histogram(pred[(pred > p1) & (pred < p99)], bins=NBINS)
+        # centers_out = 0.5*(edges_out[1:] + edges_out[:-1])
+        # centers = 0.5*(edges[1:] + edges[:-1])
+        # plt.figure()
+        # plt.step(centers, counts, where="mid", label="Input", color="blue", alpha=0.7)
+        # plt.step(centers_out, counts_out, where="mid", label="Output", color="red", alpha=0.7)
+        # plt.legend()
+        # plt.title(f"Histogram of volume {fname} (DRF={args.drf})")
+        # plt.xlabel("Intensity (Bq/mL)")
+        # plt.ylabel("Voxel counts")
+        # plt.grid(True)
+        # plt.savefig(os.path.join("/root/low_dose_pet_235/figures_explorer", f"{os.path.splitext(fname)[0]}_hist_input.png"))
+        # ###
+        # print(f"Input sum: {vol.sum():.2f} Bq")
         
         # Determine units from CSV; preserve BQML if already present
         units_val = (row.get("ImageUnits") or row.get("Units") or "").strip().upper()
