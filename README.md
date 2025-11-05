@@ -1,11 +1,10 @@
-# low_dose_pet_235
+# Ultra-Low Dose PET Imaging Challenge at IEEE MIC 2025: team despacho 235 (Universidad Complutense de Madrid)
 
-model training + inference for low-dose PET denoising.
+Abstract [here](https://docs.google.com/document/d/1neA3LrznxqXWd78N11c6olObeVPOOW2nzeqWqZe_vmg/edit?usp=sharing)
 
-Data layout assumed:
-- Inputs at `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects/<patient>/1-10 dose`
-- Targets at `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/all_subjects/<patient>/Full_dose`
-- Outputs written to `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/<patient>.nii.gz`
+Challenge webpage [link](https://udpet-challenge.github.io/).
+
+Model training + inference for low-dose PET denoising.
 
 ## Install
 
@@ -26,10 +25,17 @@ Notes
 
 ## Run
 
-Run the training + validation script directly. Specify the dose reduction factor (DRF) for the input folder name `1-<DRF> dose`:
+Run the training + validation script directly. Specify the dose reduction factor (DRF) for the input folder.
 
+For the Siemens Quadra data:
 ```
 python3 low_dose_pet_235/train.py --drf 10
+```
+
+For the United Explorer data:
+
+```
+python3 low_dose_pet_235/train_explorer.py --drf 10 
 ```
 
 Flags
@@ -39,7 +45,7 @@ Flags
 
 What it does
 - Trains model on 96x96x96 patches (stride 80) with flips/rotations.
-- Loss: 0.9*MSE + 0.1*SSIM using AdamW.
+- Loss: 0.95*MSE + 0.05*SSIM using AdamW.
 - Saves training/validation curves to `low_dose_pet_235/figures/training_curves_<RUNID>.png`.
 - Writes per-patient NIfTI outputs to `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output`.
 - Prints baseline (input→target) vs model (output→target) MSE/SSIM and saves a CSV summary next to outputs.
@@ -48,11 +54,24 @@ Quick tips
 - For a short test, edit `MAX_PATIENTS` and `EPOCHS` near the top of `low_dose_pet_235/train.py`.
 - Ensure the expected data folders exist and contain a single DICOM/IMA series each.
 
-## Artifacts and outputs
+## Outputs
 
 - Models: `low_dose_pet_235/trained-models/<MODEL_NAME>_<RUNID>.pt`
-- Curves: `low_dose_pet_235/figures/training_curves_<RUNID>.png`
-- Validation examples: `low_dose_pet_235/figures/<RUNID>_<PATIENT>_coronal.png`
-- Metrics CSV: `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/metrics_summary_<RUNID>.csv`
+- Curves: `low_dose_pet_235/figures/training_curves_<MODEL_NAME>_<RUNID>.png`
+- Validation examples: `low_dose_pet_235/figures/<MODEL_NAME>_<RUNID>_<PATIENT>_coronal.png`
+- Metrics CSV: `/root/PET_LOWDOSE/TRAINING_DATA/Bern-Inselspital-2022/output/metrics_summary_<MODEL_NAME>_<RUNID>.csv`
 
 `<RUNID>` is the date and hour+minute of the run plus the DRF, formatted as `YYYYMMDD_HHMM_drf<DRF>`.
+
+## Inference
+Run the test script specifying the DRF. Define the pretrained model in `low_dose_pet_235/train.py`.
+
+For the Siemens Quadra data:
+```
+python3 low_dose_pet_235/test.py --drf 10
+```
+For the United Explorer data:
+
+```
+python3 low_dose_pet_235/test_explorer.py --drf 10
+```
