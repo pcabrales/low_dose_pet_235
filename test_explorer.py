@@ -196,7 +196,7 @@ def main():
         return
 
     # MONAI sliding window inferer matching train.py validation overlap
-    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.2, mode="gaussian")  ###0.75
+    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.5, mode="gaussian")  ###0.75
 
     # Load global normalization percentiles computed at training time
     try:
