@@ -1,12 +1,20 @@
-# Ultra-Low Dose PET Imaging Challenge at IEEE MIC 2025: team despacho 235 (Universidad Complutense de Madrid)
-
-Abstract [here](https://docs.google.com/document/d/1neA3LrznxqXWd78N11c6olObeVPOOW2nzeqWqZe_vmg/edit?usp=sharing)
+# Ultra-Low Dose PET Imaging Challenge at IEEE MIC 2025: team 235 (Universidad Complutense de Madrid)
 
 Challenge webpage [link](https://udpet-challenge.github.io/).
 
-Model training + inference for low-dose PET denoising.
+Abstract [link](https://docs.google.com/document/d/1neA3LrznxqXWd78N11c6olObeVPOOW2nzeqWqZe_vmg/edit?usp=sharing).
 
-## Install
+
+## Training approaches
+
+### Adaptive
+The code for the noise-adaptive approach (nnFormer-FiLM) is found in folders `film_nnformer_uexplorer` and `film_nnformer_uexplorer`. You will need to install nnFormer from [here](https://github.com/282857341/nnFormer).
+
+### Dedicated
+The rest of the code is dedicated to the multi-model, noise-specific approach (nnFormer-composite). It includes the relevant nnFormer architecture within the `nnFormer` folder.
+
+
+#### Install
 
 Requires Python 3.9+.
 
@@ -23,7 +31,7 @@ Notes
 - This installs `torch`, `monai`, `SimpleITK`, and other dependencies. Check `pyproject.toml` for details.
 - If you need a specific CUDA build of PyTorch, follow the instructions at https://pytorch.org/get-started/locally/ before running `pip install -e .`.
 
-## Run
+#### Run
 
 Run the training + validation script directly. Specify the dose reduction factor (DRF) for the input folder.
 
@@ -54,7 +62,7 @@ Quick tips
 - For a short test, edit `MAX_PATIENTS` and `EPOCHS` near the top of `low_dose_pet_235/train.py`.
 - Ensure the expected data folders exist and contain a single DICOM/IMA series each.
 
-## Outputs
+#### Outputs
 
 - Models: `low_dose_pet_235/trained-models/<MODEL_NAME>_<RUNID>.pt`
 - Curves: `low_dose_pet_235/figures/training_curves_<MODEL_NAME>_<RUNID>.png`
@@ -63,7 +71,7 @@ Quick tips
 
 `<RUNID>` is the date and hour+minute of the run plus the DRF, formatted as `YYYYMMDD_HHMM_drf<DRF>`.
 
-## Inference
+#### Inference
 Run the test script specifying the DRF. Define the pretrained model in `low_dose_pet_235/train.py`.
 
 For the Siemens Quadra data:
