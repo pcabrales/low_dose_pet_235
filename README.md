@@ -8,7 +8,7 @@ Abstract [link](https://docs.google.com/document/d/1neA3LrznxqXWd78N11c6olObeVPO
 ## Training approaches
 
 ### Adaptive
-The code for the noise-adaptive approach (nnFormer-FiLM) is found in folders `film_nnformer_uexplorer` and `film_nnformer_uexplorer`. You will need to install nnFormer from [here](https://github.com/282857341/nnFormer).
+The code for the noise-adaptive approach (nnFormer-FiLM) is found in folders `film_nnformer_uexplorer` and `film_nnformer_quadra`. You will need to install nnFormer from [here](https://github.com/282857341/nnFormer).
 
 ### Dedicated
 The rest of the code is dedicated to the multi-model, noise-specific approach (nnFormer-composite). It includes the relevant nnFormer architecture within the `nnFormer` folder.
