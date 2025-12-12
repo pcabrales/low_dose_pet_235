@@ -1,5 +1,7 @@
 # Ultra-Low Dose PET Imaging Challenge at IEEE MIC 2025: team 235 (Universidad Complutense de Madrid)
 
+🥉 We won the 3rd prize in the challenge with this model! 🎉
+
 Challenge webpage [link](https://udpet-challenge.github.io/).
 
 Abstract [link](https://docs.google.com/document/d/1neA3LrznxqXWd78N11c6olObeVPOOW2nzeqWqZe_vmg/edit?usp=sharing).
